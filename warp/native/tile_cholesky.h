@@ -148,12 +148,11 @@ inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut 
         const int jc = lane + c * BD;
         if (jc < n) {
 #pragma clang loop unroll(full)
-            for (int i = 0; i < n; ++i) {
-                if (i >= jc)
-                    Out.data(idx(i, jc)) = col[c][i];
-                else
-                    Out.data(idx(jc, i)) = T {};  // zero the opposite triangle, row jc
-            }
+            // Every lane writes only the cells of its own columns: L[i, jc] for i >= jc and the zeros
+            // above it. Zeroing the mirrored cell instead would hit a column owned by another lane, and
+            // with more than one column per lane that zero lands after the owner wrote its value.
+            for (int i = 0; i < n; ++i)
+                Out.data(idx(i, jc)) = (i >= jc) ? col[c][i] : T {};
         }
     }
     WP_TILE_SYNC();
