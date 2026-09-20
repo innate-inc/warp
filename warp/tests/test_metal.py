@@ -137,7 +137,7 @@ def _make_tile_ops_kernel(n: int):
 
 
 def _make_tile_matmul_kernel(n: int):
-    """Returning and accumulating matrix products of shared ``n x n`` tiles."""
+    """Compute the returning and the accumulating matrix product of shared ``n x n`` tiles."""
 
     @wp.kernel(enable_backward=False, module="unique")
     def tile_products(a: wp.array3d[float], b: wp.array3d[float], product: wp.array3d[float], acc: wp.array3d[float]):
