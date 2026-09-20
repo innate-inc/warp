@@ -4,6 +4,7 @@
 """Behavior specific to the Metal backend, exercised through the public API."""
 
 import gc
+import itertools
 import unittest
 
 import numpy as np
@@ -99,6 +100,45 @@ def _make_cholesky_kernel(n: int):
         wp.tile_store(factor[w], t)
         rhs = wp.tile_load(b[w], shape=(n,))
         wp.tile_store(x[w], wp.tile_cholesky_solve(t, rhs, fill_mode="upper"))
+
+    return factor_and_solve
+
+
+def _make_cholesky_variant_kernel(n: int, upper: bool, inplace_factor: bool, shared: bool):
+    """Factor and solve one ``n x n`` system per block, with the variant chosen at compile time.
+
+    ``inplace_factor`` pairs the in-place factorization with the out-of-place solve, which is how MuJoCo
+    Warp's constraint solver calls them; the other variant pairs the out-of-place factorization with the
+    in-place solve, so the two variants cover all four builtins.
+    """
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def factor_and_solve(a: wp.array3d[float], b: wp.array2d[float], factor: wp.array3d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        if wp.static(shared):
+            t = wp.tile_load(a[w], shape=(n, n), storage="shared")
+            rhs = wp.tile_load(b[w], shape=(n,), storage="shared")
+        else:
+            t = wp.tile_load(a[w], shape=(n, n))
+            rhs = wp.tile_load(b[w], shape=(n,))
+        if wp.static(inplace_factor and upper):
+            wp.tile_cholesky_inplace(t, fill_mode="upper")
+            wp.tile_store(factor[w], t)
+            wp.tile_store(x[w], wp.tile_cholesky_solve(t, rhs, fill_mode="upper"))
+        elif wp.static(inplace_factor):
+            wp.tile_cholesky_inplace(t)
+            wp.tile_store(factor[w], t)
+            wp.tile_store(x[w], wp.tile_cholesky_solve(t, rhs))
+        elif wp.static(upper):
+            u = wp.tile_cholesky(t, fill_mode="upper")
+            wp.tile_store(factor[w], u)
+            wp.tile_cholesky_solve_inplace(u, rhs, fill_mode="upper")
+            wp.tile_store(x[w], rhs)
+        else:
+            l = wp.tile_cholesky(t)
+            wp.tile_store(factor[w], l)
+            wp.tile_cholesky_solve_inplace(l, rhs)
+            wp.tile_store(x[w], rhs)
 
     return factor_and_solve
 
@@ -340,6 +380,54 @@ class TestMetal(unittest.TestCase):
                 msg = f"n={n}, block_dim={block_dim}"
                 np.testing.assert_allclose(factor.numpy(), u_ref, rtol=1e-4, atol=1e-4, err_msg=msg)
                 np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
+
+    def test_tile_cholesky_across_register_path_limits(self):
+        """Factor and solve at sizes on both sides of every limit of the register Cholesky.
+
+        Metal factors in registers when ``block_dim <= 32`` and ``n <= 40`` and falls back to the generic
+        cooperative code otherwise, and inside the register path the number of columns per lane changes
+        at every multiple of ``block_dim``.
+        """
+        rng = np.random.default_rng(4)
+        worlds = 3
+        launched = 0
+        for block_dim in (16, 32):
+            for n in sorted({block_dim - 1, block_dim, block_dim + 1, 39, 40, 41, 2 * block_dim + 1}):
+                m = rng.standard_normal((worlds, n, n)).astype(np.float32)
+                a_np = m @ m.transpose(0, 2, 1) + n * np.eye(n, dtype=np.float32)
+                b_np = rng.standard_normal((worlds, n)).astype(np.float32)
+                x_ref = np.linalg.solve(a_np.astype(np.float64), b_np.astype(np.float64)[..., None])[..., 0]
+                l_ref = np.linalg.cholesky(a_np.astype(np.float64))
+                for upper, inplace_factor, shared in itertools.product((False, True), repeat=3):
+                    msg = (
+                        f"n={n}, block_dim={block_dim}, upper={upper}, inplace_factor={inplace_factor}, shared={shared}"
+                    )
+                    factor = wp.zeros((worlds, n, n), dtype=float, device=self.device)
+                    x = wp.zeros((worlds, n), dtype=float, device=self.device)
+                    try:
+                        wp.launch_tiled(
+                            _make_cholesky_variant_kernel(n, upper, inplace_factor, shared),
+                            dim=[worlds],
+                            inputs=[
+                                wp.array(a_np, dtype=float, device=self.device),
+                                wp.array(b_np, dtype=float, device=self.device),
+                                factor,
+                                x,
+                            ],
+                            device=self.device,
+                            block_dim=block_dim,
+                        )
+                    except RuntimeError as e:
+                        # tiles of 65 x 65 floats can exceed the threadgroup memory of the device
+                        if n <= 41 or "threadgroup memory" not in str(e):
+                            raise
+                        continue
+                    launched += 1
+                    # the whole matrix: the factorization also zeroes the other triangle
+                    ref = l_ref.transpose(0, 2, 1) if upper else l_ref
+                    np.testing.assert_allclose(factor.numpy(), ref, rtol=1e-4, atol=1e-4, err_msg=msg)
+                    np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
+        self.assertGreaterEqual(launched, 2 * 6 * 8)
 
     def test_tile_ops_across_block_boundary(self):
         """Tile sizes just below, at and above the block size, and above two blocks.
