@@ -88,6 +88,21 @@ def mat44_products_inverse(a: wp.array[wp.mat44], b: wp.array[wp.mat44], out: wp
             out[16 + i * 4 + j] = 3.0 * d[i, j]
 
 
+def _make_cholesky_kernel(n: int):
+    """Factor and solve one ``n x n`` system per thread block with the tile Cholesky builtins."""
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def factor_and_solve(a: wp.array3d[float], b: wp.array2d[float], factor: wp.array3d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n), storage="shared")
+        wp.tile_cholesky_inplace(t, fill_mode="upper")
+        wp.tile_store(factor[w], t)
+        rhs = wp.tile_load(b[w], shape=(n,))
+        wp.tile_store(x[w], wp.tile_cholesky_solve(t, rhs, fill_mode="upper"))
+
+    return factor_and_solve
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -250,6 +265,32 @@ class TestMetal(unittest.TestCase):
                     np.testing.assert_allclose(
                         on_metal, on_cpu, rtol=1e-3, atol=1e-4, err_msg=f"{kernel.key}[{selected}]"
                     )
+
+    def test_tile_cholesky_larger_than_block(self):
+        """A matrix larger than the launch block size gives each lane several columns of the factor.
+
+        The register Cholesky used to zero the mirrored cell, which belongs to another lane's column, so
+        the factor was wrong whenever ``n > block_dim`` (up to the size where the register path ends).
+        MuJoCo Warp hits this with any model of more than 32 degrees of freedom.
+        """
+        rng = np.random.default_rng(0)
+        worlds = 4
+        for n in (27, 33, 35, 40):
+            m = rng.standard_normal((worlds, n, n)).astype(np.float32)
+            a_np = m @ m.transpose(0, 2, 1) + n * np.eye(n, dtype=np.float32)
+            b_np = rng.standard_normal((worlds, n)).astype(np.float32)
+            x_ref = np.linalg.solve(a_np.astype(np.float64), b_np.astype(np.float64)[..., None])[..., 0]
+            u_ref = np.linalg.cholesky(a_np.astype(np.float64)).transpose(0, 2, 1)
+            kernel = _make_cholesky_kernel(n)
+            for block_dim in (16, 32, 64):
+                a = wp.array(a_np, dtype=float, device=self.device)
+                b = wp.array(b_np, dtype=float, device=self.device)
+                factor = wp.zeros((worlds, n, n), dtype=float, device=self.device)
+                x = wp.zeros((worlds, n), dtype=float, device=self.device)
+                wp.launch_tiled(kernel, dim=[worlds], inputs=[a, b, factor, x], device=self.device, block_dim=block_dim)
+                msg = f"n={n}, block_dim={block_dim}"
+                np.testing.assert_allclose(factor.numpy(), u_ref, rtol=1e-4, atol=1e-4, err_msg=msg)
+                np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
 
 
 class TestMetalInlineBudget(unittest.TestCase):
