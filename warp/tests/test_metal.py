@@ -103,6 +103,55 @@ def _make_cholesky_kernel(n: int):
     return factor_and_solve
 
 
+def _make_tile_ops_kernel(n: int):
+    """Reductions, scan and sort on one shared ``n``-element tile per thread block."""
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def tile_ops(
+        a: wp.array2d[float],
+        keys_in: wp.array2d[int],
+        total: wp.array2d[float],
+        lowest: wp.array2d[float],
+        highest: wp.array2d[float],
+        arg_lowest: wp.array2d[int],
+        arg_highest: wp.array2d[int],
+        running: wp.array2d[float],
+        keys_out: wp.array2d[int],
+        order: wp.array2d[int],
+    ):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n,), storage="shared")
+        wp.tile_store(total[w], wp.tile_sum(t))
+        wp.tile_store(lowest[w], wp.tile_min(t))
+        wp.tile_store(highest[w], wp.tile_max(t))
+        wp.tile_store(arg_lowest[w], wp.tile_argmin(t))
+        wp.tile_store(arg_highest[w], wp.tile_argmax(t))
+        wp.tile_store(running[w], wp.tile_scan_inclusive(t))
+        keys = wp.tile_load(keys_in[w], shape=(n,), storage="shared")
+        values = wp.tile_arange(n, dtype=int, storage="shared")
+        wp.tile_sort(keys, values)
+        wp.tile_store(keys_out[w], keys)
+        wp.tile_store(order[w], values)
+
+    return tile_ops
+
+
+def _make_tile_matmul_kernel(n: int):
+    """Returning and accumulating matrix products of shared ``n x n`` tiles."""
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def tile_products(a: wp.array3d[float], b: wp.array3d[float], product: wp.array3d[float], acc: wp.array3d[float]):
+        w = wp.tid()
+        ta = wp.tile_load(a[w], shape=(n, n), storage="shared")
+        tb = wp.tile_load(b[w], shape=(n, n), storage="shared")
+        wp.tile_store(product[w], wp.tile_matmul(ta, tb))
+        sum_tile = wp.tile_load(a[w], shape=(n, n), storage="shared")
+        wp.tile_matmul(ta, tb, sum_tile)
+        wp.tile_store(acc[w], sum_tile)
+
+    return tile_products
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -291,6 +340,74 @@ class TestMetal(unittest.TestCase):
                 msg = f"n={n}, block_dim={block_dim}"
                 np.testing.assert_allclose(factor.numpy(), u_ref, rtol=1e-4, atol=1e-4, err_msg=msg)
                 np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
+
+    def test_tile_ops_across_block_boundary(self):
+        """Tile sizes just below, at and above the block size, and above two blocks.
+
+        Operations with a Metal-specific implementation split a tile over the lanes of a block, so the
+        interesting sizes are the ones where the number of elements per lane changes.
+        """
+        rng = np.random.default_rng(2)
+        worlds = 3
+        for block_dim in (16, 32, 64):
+            for n in (block_dim - 1, block_dim, block_dim + 1, 2 * block_dim + 1):
+                a_np = rng.standard_normal((worlds, n)).astype(np.float32)
+                keys_np = rng.permutation(worlds * n).reshape(worlds, n).astype(np.int32)
+                expected = {
+                    "total": a_np.sum(1, keepdims=True),
+                    "lowest": a_np.min(1, keepdims=True),
+                    "highest": a_np.max(1, keepdims=True),
+                    "arg_lowest": a_np.argmin(1)[:, None],
+                    "arg_highest": a_np.argmax(1)[:, None],
+                    "running": np.cumsum(a_np.astype(np.float64), 1),
+                    "keys_out": np.sort(keys_np, 1),
+                    "order": np.argsort(keys_np, 1),
+                }
+                out = {
+                    name: wp.zeros(ref.shape, dtype=int if ref.dtype.kind == "i" else float, device=self.device)
+                    for name, ref in expected.items()
+                }
+                wp.launch_tiled(
+                    _make_tile_ops_kernel(n),
+                    dim=[worlds],
+                    inputs=[
+                        wp.array(a_np, dtype=float, device=self.device),
+                        wp.array(keys_np, dtype=int, device=self.device),
+                        *out.values(),
+                    ],
+                    device=self.device,
+                    block_dim=block_dim,
+                )
+                for name, ref in expected.items():
+                    np.testing.assert_allclose(
+                        out[name].numpy(), ref, rtol=1e-4, atol=1e-4, err_msg=f"{name}, n={n}, block_dim={block_dim}"
+                    )
+
+    def test_tile_matmul_across_block_boundary(self):
+        rng = np.random.default_rng(3)
+        worlds = 3
+        for block_dim in (16, 32):
+            for n in (block_dim - 1, block_dim, block_dim + 1):
+                a_np = rng.standard_normal((worlds, n, n)).astype(np.float32)
+                b_np = rng.standard_normal((worlds, n, n)).astype(np.float32)
+                product = wp.zeros((worlds, n, n), dtype=float, device=self.device)
+                acc = wp.zeros((worlds, n, n), dtype=float, device=self.device)
+                wp.launch_tiled(
+                    _make_tile_matmul_kernel(n),
+                    dim=[worlds],
+                    inputs=[
+                        wp.array(a_np, dtype=float, device=self.device),
+                        wp.array(b_np, dtype=float, device=self.device),
+                        product,
+                        acc,
+                    ],
+                    device=self.device,
+                    block_dim=block_dim,
+                )
+                ref = a_np.astype(np.float64) @ b_np
+                msg = f"n={n}, block_dim={block_dim}"
+                np.testing.assert_allclose(product.numpy(), ref, rtol=1e-3, atol=1e-3, err_msg=msg)
+                np.testing.assert_allclose(acc.numpy(), a_np + ref, rtol=1e-3, atol=1e-3, err_msg=msg)
 
 
 class TestMetalInlineBudget(unittest.TestCase):
