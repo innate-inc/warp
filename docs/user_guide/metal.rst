@@ -72,6 +72,10 @@ Limitations
   this on Metal, which fixed zero gradients of ``wp.mat44`` products and inverses. Kernels with hand-written,
   fully unrolled loop nests of that size can meet the same condition, so check their results and gradients
   against the CPU device.
+* Cooperative tile operations need full thread blocks, as on CUDA: launch tile kernels with
+  :func:`wp.launch_tiled() <launch_tiled>`. A plain ``wp.launch()`` whose size is not a multiple of
+  ``block_dim`` leaves the last block partial; operations on shared tiles in that block return undefined
+  values (full blocks are unaffected, and nothing hangs).
 * **Tile kernels are forward only.** Kernels that use tile operations have no adjoint on Metal.
 * If the adjoint of a module fails to compile on Metal, Warp warns and rebuilds the module forward-only, so the
   forward pass keeps working. Launching one of its backward kernels raises.
