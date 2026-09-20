@@ -423,10 +423,9 @@ class TestMetal(unittest.TestCase):
                             raise
                         continue
                     launched += 1
-                    # the in-place factorization leaves the input in the other triangle
-                    stored = np.triu(factor.numpy()) if upper else np.tril(factor.numpy())
+                    # the whole matrix: the factorization also zeroes the other triangle
                     ref = l_ref.transpose(0, 2, 1) if upper else l_ref
-                    np.testing.assert_allclose(stored, ref, rtol=1e-4, atol=1e-4, err_msg=msg)
+                    np.testing.assert_allclose(factor.numpy(), ref, rtol=1e-4, atol=1e-4, err_msg=msg)
                     np.testing.assert_allclose(x.numpy(), x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
         self.assertGreaterEqual(launched, 2 * 6 * 8)
 
