@@ -205,6 +205,33 @@ class TestMetal(unittest.TestCase):
         wp.sparse.bsr_set_from_triplets(m, rows, cols, vals)  # fine outside a capture
         self.assertEqual(m.nnz_sync(), 2)
 
+    def test_translation_ranges_are_checked(self):
+        """GPU addresses must stay out of other allocations' host ranges, or stored pointers are mistranslated."""
+        import ctypes  # noqa: PLC0415
+
+        core = wp._src.context.runtime.core
+
+        def check(*triples):
+            flat = (ctypes.c_uint64 * (3 * len(triples)))(*[v for t in triples for v in t])
+            return core.wp_metal_check_translation_ranges(flat, len(triples))
+
+        self.assertEqual(check((0x1000, 0x100, 0x10_0000), (0x2000, 0x100, 0x20_0000)), 0)
+        self.assertEqual(check((0x1000, 0x100, 0x1000)), 0)  # GPU address equal to host address: identity
+        self.assertEqual(check((0x1000, 0x100, 0x2080), (0x2000, 0x100, 0x30_0000)), -1)  # inside another range
+        self.assertEqual(check((0x1000, 0x100, 0x1080)), -1)  # inside its own range at a different offset
+        self.assertEqual(check((0x1000, 0x100, 0x0F80), (0x3000, 0x10, 0x3000)), -1)  # reaches into the range
+
+        # a real allocation set, including an imported host array, passes the same check on every launch
+        keep = [wp.zeros(n, dtype=float, device=self.device) for n in (1, 16, 4096, 1 << 22)]
+        host = np.zeros(1 << 16, dtype=np.float32)
+        imported = wp.array(host, dtype=float, device="cpu", copy=False)
+        wp.launch(increment_kernel, dim=host.size, inputs=[imported], device=self.device)
+        for a in keep:
+            wp.launch(increment_kernel, dim=a.shape[0], inputs=[a], device=self.device)
+        wp.synchronize_device(self.device)
+        np.testing.assert_array_equal(host, 1.0)
+        np.testing.assert_array_equal(keep[-1].numpy(), 1.0)
+
     def test_scalar_arguments_are_not_imported(self):
         """NumPy scalars passed by value are not treated as host arrays."""
         device = wp.get_device(self.device)
