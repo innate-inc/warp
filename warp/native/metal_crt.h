@@ -21,7 +21,9 @@
 
 // Host->GPU address translation for pointers read from memory (see refresh_table in metal.mm). The function
 // constant holds the GPU address of a slot that points at the current sorted table {count, pad, {host, length,
-// gpu}...}.
+// gpu}...}. A pointer that a kernel stored itself already holds a GPU address and is translated again when
+// read; that is the identity only because no GPU address lies in another allocation's host range, which
+// refresh_table() checks every time the table changes (translation_ranges_disjoint in metal.mm).
 constant unsigned long wp_metal_table_slot [[function_constant(0)]];
 struct wp_metal_range {
     unsigned long host, length, gpu;
