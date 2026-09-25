@@ -79,6 +79,8 @@ Limitations
 * **Tile kernels are forward only.** Kernels that use tile operations have no adjoint on Metal.
 * If the adjoint of a module fails to compile on Metal, Warp warns and rebuilds the module forward-only, so the
   forward pass keeps working. Launching one of its backward kernels raises.
+* A launch can have at most 2\ :sup:`32` - 1 threads, because Metal indexes threads with 32 bits (for tile
+  kernels, counting the threads that pad the last block). A larger launch raises.
 * Tile kernels are limited by threadgroup memory, 32 KB on current Apple GPUs. A kernel whose tiles need more
   raises at launch. Keeping block-local tiles small, or accumulating into an output tile
   (``wp.tile_matmul(a, b, out)``) instead of creating temporaries, stays below the limit.

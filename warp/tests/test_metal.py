@@ -152,6 +152,41 @@ def _make_tile_matmul_kernel(n: int):
     return tile_products
 
 
+@wp.kernel(enable_backward=False)
+def launch_coords_2d(n1: int, out: wp.array2d[int]):
+    i, j = wp.tid()
+    row = i * n1 + j
+    out[row, 0] = i
+    out[row, 1] = j
+
+
+@wp.kernel(enable_backward=False)
+def launch_coords_3d(n1: int, n2: int, out: wp.array2d[int]):
+    i, j, k = wp.tid()
+    row = (i * n1 + j) * n2 + k
+    out[row, 0] = i
+    out[row, 1] = j
+    out[row, 2] = k
+
+
+@wp.kernel(enable_backward=False)
+def launch_coords_4d(n1: int, n2: int, n3: int, out: wp.array2d[int]):
+    i, j, k, l = wp.tid()
+    row = ((i * n1 + j) * n2 + k) * n3 + l
+    out[row, 0] = i
+    out[row, 1] = j
+    out[row, 2] = k
+    out[row, 3] = l
+
+
+@wp.kernel(enable_backward=False)
+def tiled_launch_coords(block_dim: int, out: wp.array2d[int]):
+    i, lane = wp.tid()
+    wp.atomic_add(out, i * block_dim + lane, 0, 1)
+    out[i * block_dim + lane, 1] = i
+    out[i * block_dim + lane, 2] = lane
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -204,6 +239,45 @@ class TestMetal(unittest.TestCase):
         self.assertFalse(wp.get_device(self.device).is_capturing)
         wp.sparse.bsr_set_from_triplets(m, rows, cols, vals)  # fine outside a capture
         self.assertEqual(m.nnz_sync(), 2)
+
+    def test_launch_coordinates(self):
+        """Multi-dimensional and tiled launches hand every thread its own coordinates, as NumPy unravels them.
+
+        Metal unravels the linear thread index with 32-bit arithmetic; the grids here have odd extents and
+        about two million threads, so every division and remainder in the unravel is exercised.
+        """
+        cases = (
+            (launch_coords_2d, (1531, 1409)),
+            (launch_coords_3d, (97, 131, 173)),
+            (launch_coords_4d, (3, 701, 5, 211)),
+        )
+        for kernel, shape in cases:
+            n = int(np.prod(shape))
+            out = wp.full((n, len(shape)), -1, dtype=int, device=self.device)
+            wp.launch(kernel, dim=shape, inputs=[*shape[1:], out], device=self.device)
+            expected = np.stack(np.unravel_index(np.arange(n), shape), axis=1)
+            np.testing.assert_array_equal(out.numpy(), expected, err_msg=f"shape {shape}")
+
+        for block_dim in (32, 64, 256):
+            blocks = 4099
+            out = wp.zeros((blocks * block_dim, 3), dtype=int, device=self.device)
+            wp.launch_tiled(
+                tiled_launch_coords, dim=[blocks], inputs=[block_dim, out], device=self.device, block_dim=block_dim
+            )
+            got = out.numpy()
+            np.testing.assert_array_equal(got[:, 0], 1, err_msg=f"block_dim {block_dim}: every thread runs once")
+            np.testing.assert_array_equal(got[:, 1], np.repeat(np.arange(blocks), block_dim))
+            np.testing.assert_array_equal(got[:, 2], np.tile(np.arange(block_dim), blocks))
+
+    def test_launch_beyond_32_bit_thread_index_raises(self):
+        """Metal indexes threads with 32 bits, so a larger grid raises instead of wrapping around."""
+        out = wp.zeros((1, 2), dtype=int, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the 4294967295 threads"):
+            wp.launch(launch_coords_2d, dim=(65536, 65536), inputs=[65536, out], device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the 4294967295 threads"):
+            wp.launch_tiled(
+                tiled_launch_coords, dim=[(1 << 32) // 64], inputs=[64, out], device=self.device, block_dim=64
+            )
 
     def test_scalar_arguments_are_not_imported(self):
         """NumPy scalars passed by value are not treated as host arrays."""
