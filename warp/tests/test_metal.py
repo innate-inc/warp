@@ -269,6 +269,16 @@ class TestMetal(unittest.TestCase):
             np.testing.assert_array_equal(got[:, 1], np.repeat(np.arange(blocks), block_dim))
             np.testing.assert_array_equal(got[:, 2], np.tile(np.arange(block_dim), blocks))
 
+    def test_launch_beyond_32_bit_thread_index_raises(self):
+        """Metal indexes threads with 32 bits, so a larger grid raises instead of wrapping around."""
+        out = wp.zeros((1, 2), dtype=int, device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the 4294967295 threads"):
+            wp.launch(launch_coords_2d, dim=(65536, 65536), inputs=[65536, out], device=self.device)
+        with self.assertRaisesRegex(RuntimeError, "exceeds the 4294967295 threads"):
+            wp.launch_tiled(
+                tiled_launch_coords, dim=[(1 << 32) // 64], inputs=[64, out], device=self.device, block_dim=64
+            )
+
     def test_scalar_arguments_are_not_imported(self):
         """NumPy scalars passed by value are not treated as host arrays."""
         device = wp.get_device(self.device)
