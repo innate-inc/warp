@@ -487,28 +487,67 @@ void graph_record(
     graph.dispatches.push_back(d);
 }
 
+struct TranslationRange {
+    uint64_t host, length, gpu;
+};
+
+// wp_metal_translate() on the GPU maps any address inside a host range [host, host + length] to the GPU
+// address at the same offset. Descriptors that kernels themselves write into memory already hold GPU
+// addresses, and they are translated again when read, which is only harmless while no GPU address lies
+// in the host range of an allocation whose GPU address differs from its host address. Metal does not
+// document where it places GPU addresses (on current machines they are far from host memory), so this
+// checks it instead of assuming it. ranges must be sorted by host address and disjoint in host space.
+bool translation_ranges_disjoint(const TranslationRange* ranges, size_t count)
+{
+    for (size_t a = 0; a < count; ++a) {
+        const uint64_t lo = ranges[a].gpu, hi = ranges[a].gpu + ranges[a].length;
+        // the last host range that starts at or below hi, then earlier ones while they still reach lo
+        size_t b
+            = std::upper_bound(
+                  ranges, ranges + count, hi, [](uint64_t value, const TranslationRange& r) { return value < r.host; }
+              )
+            - ranges;
+        while (b > 0) {
+            const TranslationRange& r = ranges[--b];
+            if (r.host + r.length < lo)
+                break;
+            if (r.gpu != r.host) {
+                wp::set_error_string(
+                    "Metal placed GPU addresses [0x%llx, 0x%llx] inside the host range [0x%llx, 0x%llx] of another "
+                    "allocation, so addresses stored by kernels would be mistranslated. Please report this.",
+                    (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)r.host,
+                    (unsigned long long)(r.host + r.length)
+                );
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // Rewrites the translation table (sorted by host base) when allocations or imports changed.
-void refresh_table(Device& dev)
+bool refresh_table(Device& dev)
 {
     if (!dev.table_dirty)
-        return;
-    struct Range {
-        uint64_t host, length, gpu;
-    };
-    std::vector<Range> ranges;
+        return true;
+    std::vector<TranslationRange> ranges;
     ranges.reserve(dev.allocations.size() + dev.imports.size());
     for (const auto& kv : dev.allocations)
         ranges.push_back({ uint64_t(kv.first), uint64_t(kv.second.length), kv.second.gpuAddress });
     for (const auto& kv : dev.imports)
         ranges.push_back({ uint64_t(kv.first), uint64_t(kv.second.buffer.length), kv.second.buffer.gpuAddress });
-    std::sort(ranges.begin(), ranges.end(), [](const Range& a, const Range& b) { return a.host < b.host; });
-    const size_t bytes = 16 + sizeof(Range) * std::max(ranges.size(), size_t(1));
+    std::sort(ranges.begin(), ranges.end(), [](const TranslationRange& a, const TranslationRange& b) {
+        return a.host < b.host;
+    });
+    if (!translation_ranges_disjoint(ranges.data(), ranges.size()))
+        return false;
+    const size_t bytes = 16 + sizeof(TranslationRange) * std::max(ranges.size(), size_t(1));
     id<MTLBuffer> table = [dev.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     uint64_t* header = static_cast<uint64_t*>(table.contents);
     header[0] = ranges.size();
     header[1] = 0;
     if (!ranges.empty())
-        memcpy(header + 2, ranges.data(), sizeof(Range) * ranges.size());
+        memcpy(header + 2, ranges.data(), sizeof(TranslationRange) * ranges.size());
     [dev.residency_set addAllocation:table];
     dev.residency_dirty = true;
     commit_residency(dev);
@@ -517,6 +556,7 @@ void refresh_table(Device& dev)
         dev.deferred_frees.push_back(dev.table);
     dev.table = table;
     dev.table_dirty = false;
+    return true;
 }
 
 // Returns the GPU virtual address of a host pointer into a Metal allocation, or 0 if there is none.
@@ -969,6 +1009,17 @@ void wp_metal_release_host_memory(int ordinal, const void* ptr, size_t size)
     }
 }
 
+int wp_metal_check_translation_ranges(const uint64_t* triples, size_t count)
+{
+    std::vector<TranslationRange> ranges(count);
+    for (size_t i = 0; i < count; ++i)
+        ranges[i] = { triples[3 * i], triples[3 * i + 1], triples[3 * i + 2] };
+    std::sort(ranges.begin(), ranges.end(), [](const TranslationRange& a, const TranslationRange& b) {
+        return a.host < b.host;
+    });
+    return translation_ranges_disjoint(ranges.data(), ranges.size()) ? 0 : -1;
+}
+
 uint64_t wp_metal_gpu_address(int ordinal, const void* ptr)
 {
     WP_METAL_LOCK();
@@ -1124,7 +1175,8 @@ int wp_metal_launch_kernel(
 
         if (profiler().enabled && !flush(*dev))
             return -1;
-        refresh_table(*dev);
+        if (!refresh_table(*dev))
+            return -1;
         id<MTLComputeCommandEncoder> encoder = get_encoder(*dev);
         [encoder setComputePipelineState:pipeline];
         if (bounds_size > 0)
@@ -1321,7 +1373,8 @@ int wp_metal_graph_launch(int ordinal, void* handle)
 static int graph_launch(Device& device, Graph* graph)
 {
     Device* dev = &device;
-    refresh_table(device);  // recorded kernels translate host pointers they read from memory, too
+    if (!refresh_table(device))  // recorded kernels translate host pointers they read from memory, too
+        return -1;
     {
         size_t next_host_op = 0;
         auto run_host_ops = [&](size_t before_dispatch) {
