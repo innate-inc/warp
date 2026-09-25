@@ -2196,9 +2196,38 @@ struct launch_coord_t {
 
 // unravels a linear thread index to the corresponding launch grid coord (up to 4d)
 template <int N>
-inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bounds_t<N> WP_THREAD& bounds)
+inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear_index, const launch_bounds_t<N> WP_THREAD& bounds)
 {
     launch_coord_t coord = { 0, 0, 0, 0 };
+#if defined(__METAL_VERSION__)
+    // Metal grids are indexed with 32 bits and Apple GPUs have no 64-bit integer division, which would
+    // otherwise run in software for every thread of a multi-dimensional launch.
+    uint32_t linear = static_cast<uint32_t>(linear_index);
+    if (bounds.coord_mult > 1)
+        linear /= static_cast<uint32_t>(bounds.coord_mult);
+
+    if constexpr (N > 3) {
+        coord.l = linear % static_cast<uint32_t>(bounds.shape[3]);
+        linear /= static_cast<uint32_t>(bounds.shape[3]);
+    }
+
+    if constexpr (N > 2) {
+        coord.k = linear % static_cast<uint32_t>(bounds.shape[2]);
+        linear /= static_cast<uint32_t>(bounds.shape[2]);
+    }
+
+    if constexpr (N > 1) {
+        coord.j = linear % static_cast<uint32_t>(bounds.shape[1]);
+        linear /= static_cast<uint32_t>(bounds.shape[1]);
+    }
+
+    if constexpr (N > 0) {
+        coord.i = linear;
+    }
+
+    return coord;
+#else
+    size_t linear = linear_index;
 
     if (bounds.coord_mult > 1)
         linear /= bounds.coord_mult;
@@ -2223,6 +2252,7 @@ inline CUDA_CALLABLE launch_coord_t launch_coord(size_t linear, const launch_bou
     }
 
     return coord;
+#endif
 }
 
 inline CUDA_CALLABLE int block_dim()

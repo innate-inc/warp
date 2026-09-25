@@ -745,6 +745,10 @@ bool dispatch_memory_kernel(
 {
     if (num_bytes == 0)
         return true;
+    if ((num_bytes + 15) / 16 > UINT32_MAX) {  // one 16-byte word per thread, 32-bit thread positions
+        wp::set_error_string("Memory operation of %zu bytes exceeds what one Metal dispatch can index", num_bytes);
+        return false;
+    }
     for (size_t offset : pointer_offsets) {
         if (!translate_pointer(dev, static_cast<char*>(args), args_size, offset))
             return false;
@@ -1087,6 +1091,14 @@ int wp_metal_launch_kernel(
         id<MTLComputePipelineState> pipeline = (__bridge id<MTLComputePipelineState>)kernel;
         size_t max_threads = pipeline.maxTotalThreadsPerThreadgroup;
         size_t group_size = std::min(std::max(size_t(threads_per_threadgroup), size_t(1)), max_threads);
+        // thread_position_in_grid is 32-bit, and launch_coord() unravels it with 32-bit arithmetic; tile kernels
+        // dispatch whole threadgroups, so the padded grid has to fit as well.
+        if (num_threads > UINT32_MAX - (group_size - 1)) {
+            wp::set_error_string(
+                "Launch of %zu threads exceeds the %u threads a Metal dispatch can index", num_threads, UINT32_MAX
+            );
+            return -1;
+        }
 
         // the first group_size words of the threadgroup buffer hold the shared-tile arena's per-lane offsets
         threadgroup_memory_bytes += align_up(group_size * sizeof(unsigned int), kThreadgroupMemoryAlignment);
