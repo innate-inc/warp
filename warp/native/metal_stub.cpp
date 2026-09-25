@@ -36,6 +36,7 @@ int wp_metal_owns_pointer(int, const void*) { return unavailable(), 0; }
 int wp_metal_capture_host_call(int, void*, const unsigned long long*, int) { return unavailable(), 0; }
 void wp_metal_release_host_memory(int, const void*, size_t) { unavailable(); }
 
+int wp_metal_check_translation_ranges(const uint64_t*, size_t) { return unavailable(), -1; }
 uint64_t wp_metal_gpu_address(int, const void*) { return unavailable(), 0; }
 
 const char* wp_metal_profile_report() { return ""; }

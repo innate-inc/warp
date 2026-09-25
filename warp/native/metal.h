@@ -31,6 +31,8 @@ WP_API void* wp_alloc_metal(int ordinal, size_t size);
 // Safe to call while GPU work using the buffer is pending; the release is deferred until that work completes.
 WP_API void wp_free_metal(int ordinal, void* ptr);
 // GPU virtual address of a pointer into a Metal allocation (what kernels dereference), or 0 with an error set.
+// Checks a table of {host, length, gpu} triples the way refresh_table() does; for tests.
+WP_API int wp_metal_check_translation_ranges(const uint64_t* triples, size_t count);
 WP_API uint64_t wp_metal_gpu_address(int ordinal, const void* ptr);
 // Makes foreign host memory (NumPy, Torch) addressable by kernels in place; refcounted per page range.
 // Returns 0 on failure, 1 when the pointer already is Metal memory, 2 when an import was registered (release it).

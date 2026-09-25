@@ -6712,6 +6712,8 @@ class Runtime:
             self.core.wp_alloc_metal.restype = ctypes.c_void_p
             self.core.wp_free_metal.argtypes = [ctypes.c_int, ctypes.c_void_p]
             self.core.wp_free_metal.restype = None
+            self.core.wp_metal_check_translation_ranges.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+            self.core.wp_metal_check_translation_ranges.restype = ctypes.c_int
             self.core.wp_metal_gpu_address.argtypes = [ctypes.c_int, ctypes.c_void_p]
             self.core.wp_metal_gpu_address.restype = ctypes.c_uint64
             self.core.wp_metal_capture_host_call.argtypes = [
