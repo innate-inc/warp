@@ -51,6 +51,22 @@ inline unsigned long wp_metal_translate(unsigned long host)
 }
 #define WP_METAL_TRANSLATE(x) wp_metal_translate((unsigned long)(x))
 
+// Device error channel: a kernel reports a failure with wp_metal_raise(code), and the next synchronize on the host
+// raises it (see check_device_error in metal.mm). The function constant holds the GPU address of a 32-bit word
+// that is 0 while no error is pending; the first error wins. Kernels that never call this pay nothing.
+constant unsigned long wp_metal_error_slot [[function_constant(1)]];
+inline void wp_metal_raise(unsigned int code)
+{
+    if (wp_metal_error_slot == 0 || code == 0)
+        return;
+    device metal::atomic_uint* word = (device metal::atomic_uint*)wp_metal_error_slot;
+    unsigned int expected = 0;
+    while (!metal::atomic_compare_exchange_weak_explicit(
+               word, &expected, code, metal::memory_order_relaxed, metal::memory_order_relaxed
+           )
+           && expected == 0) { }
+}
+
 // string.h: byte copies between thread-local objects (used for bit casts).
 inline void memcpy(thread void* dst, thread const void* src, size_t n)
 {

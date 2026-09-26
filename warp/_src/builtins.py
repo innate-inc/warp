@@ -13738,6 +13738,16 @@ def printf_dispatch_func(input_types: Mapping[str, type], return_type: Any, args
 
 # note printf calls directly to global CRT printf (no wp:: namespace prefix)
 add_builtin(
+    "metal_raise",
+    input_types={"code": int},
+    doc="Report error ``code`` from a Metal kernel; the next synchronize raises it. A no-op on other devices.",
+    group="Utility",
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
     "printf",
     input_types={"fmt": str, "*args": Any},
     namespace="",
