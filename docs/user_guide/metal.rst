@@ -117,3 +117,8 @@ Performance Notes
   is usually faster for short loops.
 * Tile kernels run one tile per threadgroup. Their throughput is bounded by threadgroup memory, so they scale less
   well with problem size than they do on CUDA.
+* A dense Cholesky solve written at a kernel's top level as ``t = wp.tile_load(A, shape=(n, n))``,
+  ``wp.tile_cholesky_inplace(t)``, optionally further ``wp.tile_load()`` calls, then ``x = wp.tile_cholesky_solve(t, y)``,
+  with ``t`` used nowhere else, runs from registers without a shared ``n x n`` tile when ``n <= 40`` and
+  ``block_dim <= 32`` (forward-only kernels). Other forms compile as written. MuJoCo Warp's constraint solver uses
+  this form.
