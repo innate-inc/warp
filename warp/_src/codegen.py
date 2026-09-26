@@ -3554,14 +3554,21 @@ class Adjoint:
 
     # Metal rewrite of a dense Cholesky solve. On Metal a tile kernel's throughput is bounded by the threadgroup
     # memory each threadgroup requests, and tile_cholesky_inplace forces its input into an n x n shared tile.
-    # At a function's top level,
-    #     t = wp.tile_load(A, shape=(n, n))
-    #     wp.tile_cholesky_inplace(t, fill_mode=F)
-    #     [name = wp.tile_load(...)]*       (reads only, e.g. the right-hand side)
-    #     x = wp.tile_cholesky_solve(t, y, fill_mode=F)
-    # with t used nowhere else is compiled as x = tile_cholesky_factor_solve_metal(A, y, fill_mode=F), which keeps
-    # the factor in registers. Only for block_dim <= 32 and n <= 40 (the register Cholesky), forward-only builds,
-    # and pure array expressions; anything else compiles exactly as before, so a failed match only costs speed.
+    # At a function's top level, a factorization whose tile comes from one of two source forms
+    #     direct:    t = wp.tile_load(A, shape=(n, n))
+    #                wp.tile_cholesky_inplace(t, fill_mode=F)
+    #     gathered:  idx = wp.tile_load(E, shape=(n*n,), offset=(o1,))
+    #                block = wp.tile_load_indexed(M, idx, shape=(n*n,)[, storage=...])
+    #                t = wp.tile_reshape(block, (n, n))
+    #                wp.tile_cholesky_inplace(t, fill_mode=F)
+    #                wp.tile_store(L, wp.tile_reshape(t, (n*n,)), offset=(o2,))
+    # followed by [name = wp.tile_load(...)]* and x = wp.tile_cholesky_solve(t, y, fill_mode=F), with the
+    # intermediate tiles used nowhere else, compiles into one call that keeps the factor in registers
+    # (tile_cholesky_factor_solve_metal, tile_cholesky_gather_factor_solve[_guarded]_metal). Only for block_dim <= 32 and
+    # n <= 40 (the register Cholesky), forward-only builds, and pure array and offset expressions; anything
+    # else compiles exactly as before, so a failed match only costs speed. The gathered form moves the factor
+    # store past the loads in between, so it allows at most one, whose array must have another name than L,
+    # and the fused call checks at run time that the store does not touch that array (device error 1).
     metal_fused_cholesky_rewrites: ClassVar[collections.Counter] = collections.Counter()  # qualname -> rewrites
 
     def _calls_warp_builtin(adj, node, name):
@@ -3605,6 +3612,29 @@ class Adjoint:
         return None
 
     @staticmethod
+    def _pure_scalar_expression(node):
+        """Names used by an expression of names, constants, array reads and + - * // %, or None otherwise."""
+        if isinstance(node, ast.Constant):
+            return set()
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            return Adjoint._pure_scalar_expression(node.operand)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod)):
+            left, right = Adjoint._pure_scalar_expression(node.left), Adjoint._pure_scalar_expression(node.right)
+            return None if left is None or right is None else left | right
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            index = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            names = {node.value.id}
+            for e in index:
+                sub = Adjoint._pure_scalar_expression(e)
+                if sub is None:
+                    return None
+                names |= sub
+            return names
+        return None
+
+    @staticmethod
     def _fill_mode(call, position):
         if len(call.args) > position:
             return None  # positional fill_mode: not matched
@@ -3616,6 +3646,127 @@ class Adjoint:
         if isinstance(modes[0], ast.Constant) and modes[0].value in ("lower", "upper"):
             return modes[0].value
         return None
+
+    @staticmethod
+    def _assigned_call(stmt):
+        """(target name, call) for ``name = call(...)``, else (None, None)."""
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and isinstance(stmt.value, ast.Call)
+        ):
+            return stmt.targets[0].id, stmt.value
+        return None, None
+
+    def _static_shape(adj, node, rank):
+        if not isinstance(node, ast.Tuple) or len(node.elts) != rank:
+            return None
+        dims = [adj._static_int(e) for e in node.elts]
+        return None if any(d is None for d in dims) else dims
+
+    @staticmethod
+    def _keywords(call):
+        return {k.arg: k.value for k in call.keywords}
+
+    def _match_cholesky_source(adj, body, i):
+        """The factorization's source form starting at body[i], or None."""
+        name, call = adj._assigned_call(body[i])
+        if name is None or not adj._calls_warp_builtin(call, "tile_load") or len(call.args) != 1:
+            return None
+        kw = adj._keywords(call)
+
+        if set(kw) == {"shape"}:  # direct
+            array_names = adj._pure_array_expression(call.args[0])
+            shape = adj._static_shape(kw["shape"], 2)
+            if array_names is None or shape is None or shape[0] != shape[1] or i + 1 >= len(body):
+                return None
+            return {
+                "form": "direct",
+                "n": shape[0],
+                "t": name,
+                "private": {name},
+                "factor": i + 1,
+                "next": i + 2,
+                "statements": [body[i], body[i + 1]],
+                "reads": array_names,
+                "args": [call.args[0]],
+            }
+
+        if set(kw) != {"shape", "offset"} or i + 4 >= len(body):  # gathered
+            return None
+        idx, E, area = name, call.args[0], adj._static_shape(kw["shape"], 1)
+        offset = kw["offset"]
+        if area is None or not isinstance(offset, ast.Tuple) or len(offset.elts) != 1:
+            return None
+        o1 = offset.elts[0]
+        block, gather = adj._assigned_call(body[i + 1])
+        if (
+            block is None
+            or not adj._calls_warp_builtin(gather, "tile_load_indexed")
+            or len(gather.args) != 2
+            or not (isinstance(gather.args[1], ast.Name) and gather.args[1].id == idx)
+        ):
+            return None
+        gkw = adj._keywords(gather)
+        storage = gkw.get("storage")
+        if (
+            not set(gkw) <= {"shape", "storage"}
+            or adj._static_shape(gkw.get("shape"), 1) != area
+            or (
+                storage is not None
+                and not (isinstance(storage, ast.Constant) and storage.value in ("shared", "register"))
+            )
+        ):
+            return None
+        M = gather.args[0]
+        t, reshape = adj._assigned_call(body[i + 2])
+        if (
+            t is None
+            or not adj._calls_warp_builtin(reshape, "tile_reshape")
+            or len(reshape.args) != 2
+            or reshape.keywords
+            or not (isinstance(reshape.args[0], ast.Name) and reshape.args[0].id == block)
+        ):
+            return None
+        shape = adj._static_shape(reshape.args[1], 2)
+        if shape is None or shape[0] != shape[1] or shape[0] * shape[1] != area[0]:
+            return None
+        store = body[i + 4]
+        if not (isinstance(store, ast.Expr) and adj._calls_warp_builtin(store.value, "tile_store")):
+            return None
+        skw = adj._keywords(store.value)
+        if len(store.value.args) != 2 or set(skw) != {"offset"}:
+            return None
+        L, flat = store.value.args
+        if not (
+            adj._calls_warp_builtin(flat, "tile_reshape")
+            and len(flat.args) == 2
+            and not flat.keywords
+            and isinstance(flat.args[0], ast.Name)
+            and flat.args[0].id == t
+            and adj._static_shape(flat.args[1], 1) == area
+            and isinstance(skw["offset"], ast.Tuple)
+            and len(skw["offset"].elts) == 1
+        ):
+            return None
+        o2 = skw["offset"].elts[0]
+        reads = [adj._pure_array_expression(E), adj._pure_array_expression(M), adj._pure_array_expression(L)]
+        reads += [adj._pure_scalar_expression(o1), adj._pure_scalar_expression(o2)]
+        if any(r is None for r in reads):
+            return None
+        return {
+            "form": "gathered",
+            "n": shape[0],
+            "t": t,
+            "private": {idx, block, t},
+            "factor": i + 3,
+            "next": i + 5,
+            "statements": body[i : i + 5],
+            "reads": set().union(*reads),
+            "store_base": L.id if isinstance(L, ast.Name) else L.value.id,
+            "args": [M, E, o1, L, o2],
+        }
 
     def _match_metal_fused_cholesky(adj, fn_node, i):
         options = adj.builder_options
@@ -3629,30 +3780,17 @@ class Adjoint:
         ):
             return None
         body = fn_node.body
+        source = adj._match_cholesky_source(body, i)
+        if source is None or not (1 <= source["n"] <= 40):
+            return None
+        t, private = source["t"], source["private"]
 
-        load = body[i]
-        if not (
-            isinstance(load, ast.Assign)
-            and len(load.targets) == 1
-            and isinstance(load.targets[0], ast.Name)
-            and adj._calls_warp_builtin(load.value, "tile_load")
-            and len(load.value.args) == 1
-            and [k.arg for k in load.value.keywords] == ["shape"]
-        ):
-            return None
-        t = load.targets[0].id
-        array_node = load.value.args[0]
-        array_names = adj._pure_array_expression(array_node)
-        shape = load.value.keywords[0].value
-        if array_names is None or t in array_names or not isinstance(shape, ast.Tuple) or len(shape.elts) != 2:
-            return None
-        n = adj._static_int(shape.elts[0])
-        if n is None or n != adj._static_int(shape.elts[1]) or not (1 <= n <= 40):
-            return None
+        def uses_private(node):
+            return any(isinstance(n_, ast.Name) and n_.id in private for n_ in ast.walk(node))
 
-        if i + 1 >= len(body):
+        if any(uses_private(a) for a in source["args"]):
             return None
-        factor = body[i + 1]
+        factor = body[source["factor"]]
         if not (
             isinstance(factor, ast.Expr)
             and adj._calls_warp_builtin(factor.value, "tile_cholesky_inplace")
@@ -3663,70 +3801,84 @@ class Adjoint:
             return None
         fill_mode = adj._fill_mode(factor.value, 1)
 
-        j = i + 2
-        bound = set()  # names assigned by the loads in between
+        j = source["next"]
+        loads, bound = [], set()  # the loads in between and the names they assign
         while j < len(body):
-            stmt = body[j]
-            if not (
-                isinstance(stmt, ast.Assign)
-                and len(stmt.targets) == 1
-                and isinstance(stmt.targets[0], ast.Name)
-                and adj._calls_warp_builtin(stmt.value, "tile_load")
-            ):
+            name, call = adj._assigned_call(body[j])
+            if name is None or not adj._calls_warp_builtin(call, "tile_load"):
                 break
-            if any(isinstance(n_, ast.Name) and n_.id == t for n_ in ast.walk(stmt)):
+            if uses_private(body[j]):
                 return None
-            bound.add(stmt.targets[0].id)
+            loads.append(body[j])
+            bound.add(name)
             j += 1
-        if j >= len(body) or fill_mode is None or bound & (array_names | {t}):
+        if j >= len(body) or fill_mode is None or bound & (source["reads"] | private):
             return None
+        guard = None
+        if source["form"] == "gathered" and loads:
+            if len(loads) > 1:
+                return None
+            guard = loads[0].value.args[0] if loads[0].value.args else None
+            guard_names = adj._pure_array_expression(guard) if guard is not None else None
+            base = guard.id if isinstance(guard, ast.Name) else getattr(getattr(guard, "value", None), "id", None)
+            if guard_names is None or base == source["store_base"]:
+                return None
 
         solve = body[j]
+        target, call = adj._assigned_call(solve)
         if not (
-            isinstance(solve, ast.Assign)
-            and len(solve.targets) == 1
-            and isinstance(solve.targets[0], ast.Name)
-            and solve.targets[0].id != t
-            and adj._calls_warp_builtin(solve.value, "tile_cholesky_solve")
-            and len(solve.value.args) == 2
-            and isinstance(solve.value.args[0], ast.Name)
-            and solve.value.args[0].id == t
-            and adj._fill_mode(solve.value, 2) == fill_mode
+            target is not None
+            and target not in private
+            and adj._calls_warp_builtin(call, "tile_cholesky_solve")
+            and len(call.args) == 2
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == t
+            and adj._fill_mode(call, 2) == fill_mode
+            and not uses_private(call.args[1])
         ):
             return None
-        rhs = solve.value.args[1]
-        if any(isinstance(n_, ast.Name) and n_.id == t for n_ in ast.walk(rhs)):
-            return None
 
-        # t must not be used anywhere else in the function
-        rewritten = {id(load), id(factor), id(solve)}
-        for stmt in body:
-            if id(stmt) in rewritten:
-                continue
-            if any(isinstance(n_, ast.Name) and n_.id == t for n_ in ast.walk(stmt)):
-                return None
-        return j, array_node, rhs, solve.targets[0].id, fill_mode
+        # the intermediate tiles must not be used anywhere else in the function
+        rewritten = {id(s) for s in (*source["statements"], solve)}
+        if any(uses_private(stmt) for stmt in body if id(stmt) not in rewritten):
+            return None
+        return {
+            "source": source,
+            "loads": loads,
+            "guard": guard,
+            "solve": j,
+            "rhs": call.args[1],
+            "fill_mode": fill_mode,
+        }
 
     def _emit_metal_fused_cholesky(adj, fn_node, i, match):
-        j, array_node, rhs, target, fill_mode = match
-        for stmt in fn_node.body[i + 2 : j]:  # the loads in between, unchanged
+        for stmt in match["loads"]:  # the loads in between, unchanged
             adj.eval(stmt)
-        solve = fn_node.body[j]
-        func = ast.Name(id="tile_cholesky_factor_solve_metal", ctx=ast.Load())
-        func.warp_func = warp._src.context.builtin_functions["tile_cholesky_factor_solve_metal"]
+        source, solve = match["source"], fn_node.body[match["solve"]]
+        if source["form"] == "direct":
+            name = "tile_cholesky_factor_solve_metal"
+        elif match["guard"] is None:
+            name = "tile_cholesky_gather_factor_solve_metal"
+        else:
+            name = "tile_cholesky_gather_factor_solve_guarded_metal"
+        func = ast.Name(id=name, ctx=ast.Load())
+        func.warp_func = warp._src.context.builtin_functions[name]
+        args = [copy.deepcopy(a) for a in source["args"]]
+        if match["guard"] is not None:
+            args.append(copy.deepcopy(match["guard"]))
         call = ast.Call(
             func=func,
-            args=[copy.deepcopy(array_node), copy.deepcopy(rhs)],
-            keywords=[ast.keyword(arg="fill_mode", value=ast.Constant(fill_mode))],
+            args=[*args, copy.deepcopy(match["rhs"])],
+            keywords=[ast.keyword(arg="fill_mode", value=ast.Constant(match["fill_mode"]))],
         )
-        stmt = ast.Assign(targets=[ast.Name(id=target, ctx=ast.Store())], value=call)
+        stmt = ast.Assign(targets=[ast.Name(id=solve.targets[0].id, ctx=ast.Store())], value=call)
         ast.copy_location(stmt, solve)
         ast.fix_missing_locations(stmt)
         for n_ in ast.walk(stmt):
             ast.copy_location(n_, solve)
         adj.eval(stmt)
         Adjoint.metal_fused_cholesky_rewrites[getattr(adj.func, "__qualname__", adj.fun_name)] += 1
-        return j + 1
+        return match["solve"] + 1
 
     def emit_If(adj, node):
         if len(node.body) == 0:

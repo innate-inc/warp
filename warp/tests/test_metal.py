@@ -296,6 +296,201 @@ def _unfused_nested(n):
     return k
 
 
+@wp.kernel(enable_backward=False)
+def raise_kernel(code: int):
+    wp.metal_raise(code)
+
+
+# The gathered form of the rewrite, shaped like MuJoCo Warp's _tile_cholesky_factorize_solve_block.
+def _gathered(n):
+    area = n * n
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(
+        adr: wp.array[int],
+        M: wp.array2d[float],
+        elemid: wp.array[int],
+        dof: wp.array[int],
+        y: wp.array2d[float],
+        x: wp.array2d[float],
+        L_out: wp.array2d[float],
+    ):
+        w, blk = wp.tid()
+        start = dof[blk]
+        idx = wp.tile_load(elemid, shape=(area,), offset=(blk * area,))
+        block = wp.tile_load_indexed(M[w], idx, shape=(area,), storage="shared")
+        L = wp.tile_reshape(block, (n, n))
+        wp.tile_cholesky_inplace(L, fill_mode="upper")
+        wp.tile_store(L_out[w], wp.tile_reshape(L, (area,)), offset=(adr[start],))
+        rhs = wp.tile_load(y[w], shape=(n,), offset=(start,))
+        sol = wp.tile_cholesky_solve(L, rhs, fill_mode="upper")
+        wp.tile_store(x[w], sol, offset=(start,))
+
+    return k
+
+
+def _gathered_nested(n):  # the same code inside a block: never rewritten, the reference on Metal
+    area = n * n
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(
+        adr: wp.array[int],
+        M: wp.array2d[float],
+        elemid: wp.array[int],
+        dof: wp.array[int],
+        y: wp.array2d[float],
+        x: wp.array2d[float],
+        L_out: wp.array2d[float],
+    ):
+        w, blk = wp.tid()
+        if w >= 0:
+            start = dof[blk]
+            idx = wp.tile_load(elemid, shape=(area,), offset=(blk * area,))
+            block = wp.tile_load_indexed(M[w], idx, shape=(area,), storage="shared")
+            L = wp.tile_reshape(block, (n, n))
+            wp.tile_cholesky_inplace(L, fill_mode="upper")
+            wp.tile_store(L_out[w], wp.tile_reshape(L, (area,)), offset=(adr[start],))
+            rhs = wp.tile_load(y[w], shape=(n,), offset=(start,))
+            sol = wp.tile_cholesky_solve(L, rhs, fill_mode="upper")
+            wp.tile_store(x[w], sol, offset=(start,))
+
+    return k
+
+
+def _gathered_two_loads(n):
+    area = n * n
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(
+        adr: wp.array[int],
+        M: wp.array2d[float],
+        elemid: wp.array[int],
+        dof: wp.array[int],
+        y: wp.array2d[float],
+        x: wp.array2d[float],
+        L_out: wp.array2d[float],
+    ):
+        w, blk = wp.tid()
+        start = dof[blk]
+        idx = wp.tile_load(elemid, shape=(area,), offset=(blk * area,))
+        block = wp.tile_load_indexed(M[w], idx, shape=(area,), storage="shared")
+        L = wp.tile_reshape(block, (n, n))
+        wp.tile_cholesky_inplace(L, fill_mode="upper")
+        wp.tile_store(L_out[w], wp.tile_reshape(L, (area,)), offset=(adr[start],))
+        other = wp.tile_load(y[w], shape=(n,), offset=(start,))
+        rhs = wp.tile_load(y[w], shape=(n,), offset=(start,))
+        sol = wp.tile_cholesky_solve(L, rhs + other * 0.0, fill_mode="upper")
+        wp.tile_store(x[w], sol, offset=(start,))
+
+    return k
+
+
+def _gathered_load_of_stored_array(n):
+    area = n * n
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(
+        adr: wp.array[int],
+        M: wp.array2d[float],
+        elemid: wp.array[int],
+        dof: wp.array[int],
+        y: wp.array2d[float],
+        x: wp.array2d[float],
+        L_out: wp.array2d[float],
+    ):
+        w, blk = wp.tid()
+        start = dof[blk]
+        idx = wp.tile_load(elemid, shape=(area,), offset=(blk * area,))
+        block = wp.tile_load_indexed(M[w], idx, shape=(area,), storage="shared")
+        L = wp.tile_reshape(block, (n, n))
+        wp.tile_cholesky_inplace(L, fill_mode="upper")
+        wp.tile_store(L_out[w], wp.tile_reshape(L, (area,)), offset=(adr[start],))
+        rhs = wp.tile_load(L_out[w], shape=(n,), offset=(adr[start],))  # reads the factor just stored
+        sol = wp.tile_cholesky_solve(L, rhs, fill_mode="upper")
+        wp.tile_store(x[w], sol, offset=(start,))
+
+    return k
+
+
+def _gathered_call_in_offset(n):
+    area = n * n
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(
+        adr: wp.array[int],
+        M: wp.array2d[float],
+        elemid: wp.array[int],
+        dof: wp.array[int],
+        y: wp.array2d[float],
+        x: wp.array2d[float],
+        L_out: wp.array2d[float],
+    ):
+        w, blk = wp.tid()
+        start = dof[blk]
+        idx = wp.tile_load(elemid, shape=(area,), offset=(wp.max(blk * area, 0),))
+        block = wp.tile_load_indexed(M[w], idx, shape=(area,), storage="shared")
+        L = wp.tile_reshape(block, (n, n))
+        wp.tile_cholesky_inplace(L, fill_mode="upper")
+        wp.tile_store(L_out[w], wp.tile_reshape(L, (area,)), offset=(adr[start],))
+        rhs = wp.tile_load(y[w], shape=(n,), offset=(start,))
+        sol = wp.tile_cholesky_solve(L, rhs, fill_mode="upper")
+        wp.tile_store(x[w], sol, offset=(start,))
+
+    return k
+
+
+def _gathered_factor_reused(n):
+    area = n * n
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(
+        adr: wp.array[int],
+        M: wp.array2d[float],
+        elemid: wp.array[int],
+        dof: wp.array[int],
+        y: wp.array2d[float],
+        x: wp.array2d[float],
+        L_out: wp.array2d[float],
+    ):
+        w, blk = wp.tid()
+        start = dof[blk]
+        idx = wp.tile_load(elemid, shape=(area,), offset=(blk * area,))
+        block = wp.tile_load_indexed(M[w], idx, shape=(area,), storage="shared")
+        L = wp.tile_reshape(block, (n, n))
+        wp.tile_cholesky_inplace(L, fill_mode="upper")
+        wp.tile_store(L_out[w], wp.tile_reshape(L, (area,)), offset=(adr[start],))
+        rhs = wp.tile_load(y[w], shape=(n,), offset=(start,))
+        sol = wp.tile_cholesky_solve(L, rhs, fill_mode="upper")
+        wp.tile_store(x[w], sol, offset=(start,))
+        total = wp.tile_sum(L)
+
+    return k
+
+
+def _gathered_problem(n, worlds, rng):
+    """Two sparse SPD blocks per world, gathered through an index array with absent and out-of-range entries."""
+    pattern = np.triu(rng.random((n, n)) < 0.7, 1)
+    pattern = pattern | pattern.T | np.eye(n, dtype=bool)
+    a = rng.standard_normal((worlds, n, n)).astype(np.float32) * pattern
+    a = (a + a.transpose(0, 2, 1)) * 0.5
+    a += (np.abs(a).sum(2).max() + 1.0) * np.eye(n, dtype=np.float32)
+    a *= pattern
+    slots = int(pattern.sum()) + 7
+    position = rng.permutation(slots)
+    elemid = np.full(2 * n * n, -1, dtype=np.int32)  # -1: absent pair
+    M = np.zeros((worlds, slots), np.float32)
+    rows, cols = np.nonzero(pattern)
+    elemid[rows * n + cols] = position[: len(rows)]
+    M[:, position[: len(rows)]] = a[:, rows, cols]
+    absent = np.nonzero(elemid[: n * n] < 0)[0]
+    elemid[rng.choice(absent, min(4, len(absent)), replace=False)] = slots + 5  # out of range above
+    elemid[n * n :] = elemid[: n * n]
+    y = rng.standard_normal((worlds, 2 * n)).astype(np.float32)
+    adr = np.zeros(2 * n, dtype=np.int32)
+    adr[0], adr[n] = 4, 4 + n * n  # the factors' offsets in L_out, by the block's first dof
+    return a, M, elemid, y, adr
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -490,6 +685,125 @@ class TestMetal(unittest.TestCase):
             )
             results.append(x.numpy())
         np.testing.assert_allclose(results[0], results[1], rtol=1e-4, atol=1e-4)
+
+    def test_device_error_raises_at_synchronize(self):
+        """A kernel's wp.metal_raise(code) is raised by the next synchronize, once, and the first error wins."""
+        device = wp.get_device(self.device)
+        wp.synchronize_device(device)
+
+        wp.launch(raise_kernel, dim=64, inputs=[7], device=device)
+        with self.assertRaisesRegex(RuntimeError, "Metal kernel reported error code 7"):
+            wp.synchronize_device(device)
+        wp.synchronize_device(device)  # cleared
+
+        wp.launch(raise_kernel, dim=1, inputs=[5], device=device)
+        wp.launch(raise_kernel, dim=1, inputs=[9], device=device)
+        with self.assertRaisesRegex(RuntimeError, "error code 5"):
+            wp.synchronize_device(device)
+        wp.synchronize_device(device)
+
+        wp.launch(raise_kernel, dim=1, inputs=[1], device=device)
+        with self.assertRaisesRegex(RuntimeError, "fused Cholesky: the factor store overlaps"):
+            wp.synchronize_device(device)
+
+        # reading an array synchronizes too, so it raises as well
+        a = wp.zeros(4, dtype=float, device=device)
+        wp.launch(raise_kernel, dim=1, inputs=[11], device=device)
+        with self.assertRaisesRegex(RuntimeError, "error code 11"):
+            a.numpy()
+        np.testing.assert_array_equal(a.numpy(), 0.0)
+
+        # kernels that do not report leave the channel clear
+        wp.launch(increment_kernel, dim=4, inputs=[a], device=device)
+        wp.synchronize_device(device)
+
+    def test_device_error_raises_after_graph_replay(self):
+        """Errors reported by a kernel in a captured graph are raised after the replay, and cleared."""
+        device = wp.get_device(self.device)
+        with wp.ScopedCapture(device=device) as capture:
+            wp.launch(raise_kernel, dim=8, inputs=[3], device=device)
+        wp.synchronize_device(device)  # capturing records, it does not run
+        for _ in range(2):
+            wp.capture_launch(capture.graph)
+            with self.assertRaisesRegex(RuntimeError, "error code 3"):
+                wp.synchronize_device(device)
+        wp.synchronize_device(device)
+
+    def _gathered_run(self, make, n, device, block_dim, problem, L_out=None):
+        a, M, elemid, y, adr = problem
+        worlds = a.shape[0]
+        x = wp.zeros((worlds, 2 * n), dtype=float, device=device)
+        if L_out is None:
+            L_out = wp.full((worlds, 2 * n * n + 9), 5.0, dtype=float, device=device)
+        kernel = make(n)
+        wp.launch_tiled(
+            kernel,
+            dim=[worlds, 2],
+            inputs=[
+                wp.array(adr, device=device),
+                wp.array(M, device=device),
+                wp.array(elemid, device=device),
+                wp.array([0, n], dtype=int, device=device),
+                wp.array(y, device=device) if not isinstance(y, wp.array) else y,
+                x,
+                L_out,
+            ],
+            device=device,
+            block_dim=block_dim,
+        )
+        meta = kernel.module.load(wp.get_device(device), block_dim).meta
+        smem = max(v for key, v in meta.items() if key.endswith("forward_smem_bytes"))
+        return L_out.numpy(), x.numpy(), smem >= n * n * 4
+
+    def test_fused_cholesky_gathered(self):
+        """MuJoCo Warp's block factorization (gather, factor, store, solve) runs from registers on Metal.
+
+        The stored factor is bit-identical to the same code compiled unfused on Metal, including absent and
+        out-of-range gather indices, and the solution matches NumPy.
+        """
+        rng = np.random.default_rng(9)
+        for block_dim in (16, 32):
+            for n in sorted({block_dim - 1, block_dim, block_dim + 1, 39, 40, 41}):
+                msg = f"n={n}, block_dim={block_dim}"
+                problem = _gathered_problem(n, 3, rng)
+                factor, x, shared = self._gathered_run(_gathered, n, self.device, block_dim, problem)
+                factor_ref, _, shared_ref = self._gathered_run(_gathered_nested, n, self.device, block_dim, problem)
+                self.assertEqual(shared, n > 40, msg)
+                self.assertTrue(shared_ref, msg)
+                np.testing.assert_array_equal(factor, factor_ref, err_msg=msg)
+                a, _, _, y, _ = problem
+                x_ref = np.linalg.solve(a.astype(np.float64), y[:, :n].astype(np.float64)[..., None])[..., 0]
+                np.testing.assert_allclose(x[:, :n], x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
+
+    def test_fused_cholesky_gathered_leaves_other_shapes_alone(self):
+        """Shapes the gathered rewrite must not take keep their shared matrix and compute what the CPU computes."""
+        rng = np.random.default_rng(10)
+        n = 35
+        for make in (
+            _gathered_two_loads,
+            _gathered_load_of_stored_array,
+            _gathered_call_in_offset,
+            _gathered_factor_reused,
+        ):
+            problem = _gathered_problem(n, 2, rng)
+            factor, x, shared = self._gathered_run(make, n, self.device, 32, problem)
+            factor_cpu, x_cpu, _ = self._gathered_run(make, n, "cpu", 1, problem)
+            self.assertTrue(shared, make.__name__)
+            np.testing.assert_allclose(factor, factor_cpu, rtol=1e-4, atol=1e-5, err_msg=make.__name__)
+            np.testing.assert_allclose(x, x_cpu, rtol=1e-3, atol=1e-4, err_msg=make.__name__)
+
+    def test_fused_cholesky_gathered_store_guard(self):
+        """The rewrite moves the factor store past the right-hand side's load, so a load of the same buffer under
+        another name raises a device error instead of reading different data."""
+        rng = np.random.default_rng(11)
+        n = 35
+        problem = _gathered_problem(n, 2, rng)
+        a, M, elemid, y, adr = problem
+        buffer = wp.zeros((2, 2 * n * n + 9), dtype=float, device=self.device)
+        buffer.numpy()[:, : 2 * n] = y  # the right-hand sides live in the buffer the factor is stored to
+        with self.assertRaisesRegex(RuntimeError, "fused Cholesky: the factor store overlaps"):
+            self._gathered_run(_gathered, n, self.device, 32, (a, M, elemid, buffer, adr), L_out=buffer)
+        wp.synchronize_device(self.device)  # the error was raised once
 
     def test_scalar_arguments_are_not_imported(self):
         """NumPy scalars passed by value are not treated as host arrays."""
