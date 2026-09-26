@@ -276,6 +276,123 @@ metal_register_cholesky_factor_solve(array_t<T> WP_THREAD& A, TileY WP_THREAD& Y
     metal_forward_subst<0, n, CPL, BD, T>(col, z, Y, lane);
     metal_backward_subst<n - 1, n, CPL, BD, T>(col, z, X, lane);
 }
+
+// Gathered form, for the rewrite of MuJoCo Warp's block factorization:
+//     idx = wp.tile_load(E, shape=(n*n,), offset=(e_off,))
+//     block = wp.tile_load_indexed(M, idx, shape=(n*n,), ...); L = wp.tile_reshape(block, (n, n))
+//     wp.tile_cholesky_inplace(L); wp.tile_store(L_out, wp.tile_reshape(L, (n*n,)), offset=(l_off,))
+//     [name = wp.tile_load(G, ...)]; x = wp.tile_cholesky_solve(L, y)
+// Element (r, c) of the block is M[k] with k = E[e_off + r * n + c], where an E element outside E reads as 0
+// (tile_load's zero fill) and an M element outside M reads as 0 (tile_load_indexed's padding rule). The factor is
+// stored as tile_cholesky_inplace leaves it, row-major, and only where tile_store's bounds check would.
+template <int I, int N, int CPL, int BD, bool Upper, typename T>
+inline WP_FORCE_INLINE void
+metal_gather_columns(thread T (&col)[CPL][N], array_t<T> WP_THREAD& M, array_t<int> WP_THREAD& E, int e_off, int lane)
+{
+    if constexpr (I < N) {
+        auto load = [&](auto C) {
+            constexpr int c = decltype(C)::value;
+            const int jc = lane + c * BD;
+            T v = T {};
+            if (jc < N && I >= jc) {
+                const int e = e_off + (Upper ? jc * N + I : I * N + jc);
+                const int k = (e >= 0 && e < E.shape[0]) ? wp::load(wp::address(E, e)) : 0;
+                if (k >= 0 && k < M.shape[0])
+                    v = wp::load(wp::address(M, k));
+            }
+            col[c][I] = v;
+        };
+        metal_static_for<0, CPL>(load);
+        metal_gather_columns<I + 1, N, CPL, BD, Upper, T>(col, M, E, e_off, lane);
+    }
+}
+
+template <int I, int N, int CPL, int BD, bool Upper, typename T>
+inline WP_FORCE_INLINE void metal_store_factor(thread T (&col)[CPL][N], array_t<T> WP_THREAD& L, int l_off, int lane)
+{
+    if constexpr (I < N) {
+        auto store = [&](auto C) {
+            constexpr int c = decltype(C)::value;
+            const int jc = lane + c * BD;
+            if (jc < N) {
+                const int e = l_off + (Upper ? jc * N + I : I * N + jc);
+                if (e >= 0 && e < L.shape[0])
+                    wp::store(wp::address(L, e), I >= jc ? col[c][I] : T {});
+            }
+        };
+        metal_static_for<0, CPL>(store);
+        metal_store_factor<I + 1, N, CPL, BD, Upper, T>(col, L, l_off, lane);
+    }
+}
+
+// Byte range [lo, hi) an array spans, from its descriptor (GPU addresses inside a kernel); empty if any
+// extent is 0.
+template <typename T> inline void metal_array_bytes(array_t<T> WP_THREAD& a, thread uint64_t& lo, thread uint64_t& hi)
+{
+    lo = hi = uint64_t(a.data);
+    for (int d = 0; d < a.ndim; ++d) {
+        if (a.shape.dims[d] <= 0) {
+            hi = lo;
+            return;
+        }
+    }
+    int64_t below = 0, above = 0;
+    for (int d = 0; d < a.ndim; ++d) {
+        const int64_t span = int64_t(a.shape.dims[d] - 1) * int64_t(a.strides[d]);
+        (span < 0 ? below : above) += span;
+    }
+    lo = uint64_t(int64_t(lo) + below);
+    hi = uint64_t(int64_t(hi) + above) + sizeof(T);
+}
+
+// Whether the factor store (elements l_off .. l_off + count - 1 of L, clipped to L like tile_store) touches
+// the bytes of G.
+template <typename T, typename G>
+inline bool metal_factor_store_overlaps(array_t<T> WP_THREAD& L, int l_off, int count, array_t<G> WP_THREAD& g)
+{
+    const int first = l_off < 0 ? 0 : l_off;
+    const int last = l_off + count - 1 < L.shape[0] - 1 ? l_off + count - 1 : L.shape[0] - 1;
+    if (first > last)
+        return false;
+    uint64_t store_lo = uint64_t(wp::address(L, first)), store_hi = uint64_t(wp::address(L, last));
+    if (store_lo > store_hi) {
+        const uint64_t t = store_lo;
+        store_lo = store_hi;
+        store_hi = t;
+    }
+    store_hi += sizeof(T);
+    uint64_t g_lo, g_hi;
+    metal_array_bytes(g, g_lo, g_hi);
+    return g_lo < g_hi && store_lo < g_hi && g_lo < store_hi;
+}
+
+template <bool Upper, typename T, typename TileY, typename TileX>
+inline WP_FORCE_INLINE void metal_register_cholesky_gather_factor_solve(
+    array_t<T> WP_THREAD& M,
+    array_t<int> WP_THREAD& E,
+    int e_off,
+    array_t<T> WP_THREAD& L,
+    int l_off,
+    TileY WP_THREAD& Y,
+    TileX WP_THREAD& X
+)
+{
+    constexpr int n = TileX::Layout::Shape::dim(0);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    constexpr int CPL = (n + BD - 1) / BD;
+    static_assert(BD > 1 && BD <= 32 && n <= 40, "the code generator only emits this for block_dim <= 32 and n <= 40");
+    static_assert(TileX::Layout::NumRegs == CPL, "the solution is a register tile with one slot per owned column");
+    const int lane = WP_TILE_THREAD_IDX;
+
+    T col[CPL][n];
+    metal_gather_columns<0, n, CPL, BD, Upper, T>(col, M, E, e_off, lane);
+    metal_register_cholesky_step<0, n, CPL, BD, T>(col, lane);
+    metal_store_factor<0, n, CPL, BD, Upper, T>(col, L, l_off, lane);
+
+    T z[CPL] = {};
+    metal_forward_subst<0, n, CPL, BD, T>(col, z, Y, lane);
+    metal_backward_subst<n - 1, n, CPL, BD, T>(col, z, X, lane);
+}
 #endif  // __METAL_VERSION__
 
 template <bool Upper, typename TileA, typename TileOut>
@@ -735,6 +852,45 @@ inline WP_FORCE_INLINE TileX WP_THREAD&
 tile_cholesky_factor_solve_metal(array_t<T> WP_THREAD& A, TileY WP_THREAD& Y, TileX WP_THREAD& X)
 {
     partitioned_gemm::metal_register_cholesky_factor_solve<Upper>(A, Y, X);
+    return X;
+}
+
+// x for the gathered form (see partitioned_gemm::metal_register_cholesky_gather_factor_solve), which also stores the
+// factor. The rewrite moves that store past the loads between the factorization and the solve; the variant with G
+// (the array such a load reads) reports error 1 and writes nothing if the store would touch G's bytes.
+template <bool Upper, typename T, typename TileY, typename TileX>
+inline WP_FORCE_INLINE TileX WP_THREAD& tile_cholesky_gather_factor_solve_metal(
+    array_t<T> WP_THREAD& M,
+    array_t<int> WP_THREAD& E,
+    int e_off,
+    array_t<T> WP_THREAD& L,
+    int l_off,
+    TileY WP_THREAD& Y,
+    TileX WP_THREAD& X
+)
+{
+    partitioned_gemm::metal_register_cholesky_gather_factor_solve<Upper>(M, E, e_off, L, l_off, Y, X);
+    return X;
+}
+
+template <bool Upper, typename T, typename G, typename TileY, typename TileX>
+inline WP_FORCE_INLINE TileX WP_THREAD& tile_cholesky_gather_factor_solve_guarded_metal(
+    array_t<T> WP_THREAD& M,
+    array_t<int> WP_THREAD& E,
+    int e_off,
+    array_t<T> WP_THREAD& L,
+    int l_off,
+    array_t<G> WP_THREAD& guard,
+    TileY WP_THREAD& Y,
+    TileX WP_THREAD& X
+)
+{
+    constexpr int n = TileX::Layout::Shape::dim(0);
+    if (partitioned_gemm::metal_factor_store_overlaps(L, l_off, n * n, guard)) {
+        wp_metal_raise(1u);
+        return X;
+    }
+    partitioned_gemm::metal_register_cholesky_gather_factor_solve<Upper>(M, E, e_off, L, l_off, Y, X);
     return X;
 }
 #endif
