@@ -864,6 +864,17 @@ inline bool CUDA_CALLABLE isinf(float x) { return ::isinf(x); }
 inline bool CUDA_CALLABLE isinf(double x) { return ::isinf(x); }
 #endif  // !WP_NO_FLOAT64
 
+// Reports an error code on Metal, raised by the next synchronize (see wp_metal_raise); a no-op elsewhere.
+inline CUDA_CALLABLE void metal_raise(int code)
+{
+#if defined(__METAL_VERSION__)
+    wp_metal_raise(static_cast<unsigned int>(code));
+#else
+    (void)code;
+#endif
+}
+inline CUDA_CALLABLE void adj_metal_raise(int, int WP_THREAD&) { }
+
 template <typename T> inline CUDA_CALLABLE void print(const T WP_THREAD&)
 {
     printf("<type without print implementation>\n");
