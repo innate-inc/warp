@@ -13738,6 +13738,16 @@ def printf_dispatch_func(input_types: Mapping[str, type], return_type: Any, args
 
 # note printf calls directly to global CRT printf (no wp:: namespace prefix)
 add_builtin(
+    "metal_raise",
+    input_types={"code": int},
+    doc="Report error ``code`` from a Metal kernel; the next synchronize raises it. A no-op on other devices.",
+    group="Utility",
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+add_builtin(
     "printf",
     input_types={"fmt": str, "*args": Any},
     namespace="",
@@ -18638,6 +18648,61 @@ add_builtin(
     hidden=True,
     is_differentiable=False,
 )
+
+
+def tile_cholesky_gather_factor_solve_metal_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return tile(dtype=Float, shape=tuple[int], storage="register")
+    m, e, dest, y = arg_types["M"], arg_types["E"], arg_types["L"], arg_types["y"]
+    if not all(is_array(a) and a.ndim == 1 for a in (m, e, dest)):
+        raise TypeError("tile_cholesky_gather_factor_solve_metal() 'M', 'E' and 'L' must be 1D arrays")
+    if not is_tile(y) or len(y.shape) != 1 or m.dtype != y.dtype or dest.dtype != y.dtype:
+        raise TypeError("tile_cholesky_gather_factor_solve_metal() 'y' must be a 1D tile of the dtype of 'M' and 'L'")
+    return tile(dtype=y.dtype, shape=y.shape, storage="register")
+
+
+def tile_cholesky_gather_factor_solve_metal_lto_dispatch_func(
+    arg_types: Mapping[str, type],
+    return_type: Any,
+    return_values: List[Var],
+    arg_values: Mapping[str, Var],
+    options: Mapping[str, Any],
+    builder: warp._src.context.ModuleBuilder,
+):
+    upper = _tile_cholesky_extract_fill_mode(arg_values, func_name="tile_cholesky_gather_factor_solve_metal")
+    names = ("M", "E", "e_off", "L", "l_off", "G", "y") if "G" in arg_values else ("M", "E", "e_off", "L", "l_off", "y")
+    return ((*(arg_values[k] for k in names), return_values[0]), [upper], [], 0)
+
+
+# Emitted only by the Metal code generator for the gathered form of the rewrite (Adjoint._match_metal_fused_cholesky):
+# gathers, factors, stores the factor and solves. The guarded variant takes G, the array a load between the
+# factorization and the solve reads, and reports device error 1 instead of storing if the factor store would touch it.
+for _name, _guard in (
+    ("tile_cholesky_gather_factor_solve_metal", False),
+    ("tile_cholesky_gather_factor_solve_guarded_metal", True),
+):
+    add_builtin(
+        _name,
+        input_types={
+            "M": array(dtype=Float),
+            "E": array(dtype=int),
+            "e_off": int,
+            "L": array(dtype=Float),
+            "l_off": int,
+            **({"G": array(dtype=Any)} if _guard else {}),
+            "y": tile(dtype=Float, shape=tuple[int]),
+            "fill_mode": str,
+        },
+        defaults={"fill_mode": "lower"},
+        value_func=tile_cholesky_gather_factor_solve_metal_value_func,
+        lto_dispatch_func=tile_cholesky_gather_factor_solve_metal_lto_dispatch_func,
+        variadic=True,
+        doc="Gather, factor, store and solve a dense Cholesky block (Metal only).",
+        group="Tile Primitives",
+        export=False,
+        hidden=True,
+        is_differentiable=False,
+    )
 
 
 add_builtin(
