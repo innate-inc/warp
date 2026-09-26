@@ -4,7 +4,9 @@
 """Behavior specific to the Metal backend, exercised through the public API."""
 
 import gc
+import os
 import unittest
+from typing import Literal
 
 import numpy as np
 
@@ -491,6 +493,76 @@ def _gathered_problem(n, worlds, rng):
     return a, M, elemid, y, adr
 
 
+@wp.kernel(enable_backward=False)
+def strided_view_sum(a: wp.array2d[float], out: wp.array[float]):
+    i, j = wp.tid()
+    wp.atomic_add(out, i, a[i, j])
+
+
+@wp.kernel(enable_backward=False)
+def indexed_copy(src: wp.indexedarray[float, Literal[2]], dst: wp.array2d[float]):
+    i, j = wp.tid()
+    dst[i, j] = src[i, j]
+
+
+@wp.kernel(enable_backward=False)
+def world_body_dof_grid(mass: wp.array2d[float], enabled: wp.array2d[int], out: wp.array2d[float]):
+    # the shape of MuJoCo Warp's (nworld, nbody, nv) kernels such as _gravity_force: most threads return at once
+    w, b, d = wp.tid()
+    if enabled[w % enabled.shape[0], b] == 0:
+        return
+    wp.atomic_add(out[w], d, mass[w % mass.shape[0], b])
+
+
+def _solver_cholesky(n):  # MuJoCo Warp's _update_gradient_cholesky, line by line
+    @wp.func
+    def search_sums(g: float, s: float):
+        return wp.vec2(g * s, s * s)
+
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(
+        grad: wp.array2d[float],
+        h: wp.array3d[float],
+        done: wp.array[bool],
+        search: wp.array2d[float],
+        dot: wp.array[float],
+    ):
+        worldid = wp.tid()
+        TILE_SIZE = wp.static(n)
+        if done[worldid]:
+            return
+        mat_tile = wp.tile_load(h[worldid], shape=(TILE_SIZE, TILE_SIZE))
+        wp.tile_cholesky_inplace(mat_tile, fill_mode="upper")
+        input_tile = wp.tile_load(grad[worldid], shape=TILE_SIZE)
+        output_tile = wp.tile_cholesky_solve(mat_tile, input_tile, fill_mode="upper")
+        sums = wp.tile_reduce(wp.add, wp.tile_map(search_sums, input_tile, output_tile))[0]
+        dot[worldid] = sums[0]
+        wp.tile_store(search[worldid], wp.tile_map(wp.mul, output_tile, -1.0))
+
+    return k
+
+
+def _metal_module_source(kernel, block_dim):
+    """The Metal source Warp generated for kernel's module, from the kernel cache."""
+    import glob  # noqa: PLC0415
+
+    for identifier in (kernel.module.get_module_identifier(block_dim), kernel.module.get_module_identifier()):
+        files = glob.glob(os.path.join(wp.config.kernel_cache_dir, identifier, "*.metal"))
+        if files:
+            with open(files[0]) as f:
+                return f.read()
+    raise FileNotFoundError(f"no Metal source for {kernel.key} in {wp.config.kernel_cache_dir}")
+
+
+def _xcrun_metal_available():
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if shutil.which("xcrun") is None:
+        return False
+    return subprocess.run(["xcrun", "-sdk", "macosx", "-f", "metal"], capture_output=True, check=False).returncode == 0
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -804,6 +876,125 @@ class TestMetal(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fused Cholesky: the factor store overlaps"):
             self._gathered_run(_gathered, n, self.device, 32, (a, M, elemid, buffer, adr), L_out=buffer)
         wp.synchronize_device(self.device)  # the error was raised once
+
+    def test_no_64_bit_division_by_runtime_values(self):
+        """Compiled Metal kernels divide 64-bit integers only by constants.
+
+        Apple GPUs have no 64-bit integer division, so a division by a runtime value runs a software routine in
+        every thread; one such division in the launch index unravel made MuJoCo Warp's grids several times
+        slower. This compiles representative kernels with the Metal compiler and checks the IR.
+        """
+        import re  # noqa: PLC0415
+        import subprocess  # noqa: PLC0415
+        import tempfile  # noqa: PLC0415
+
+        if not _xcrun_metal_available():
+            self.skipTest("the Metal compiler (xcrun metal, from Xcode) is not installed")
+        device = self.device
+        n = 35
+        rng = np.random.default_rng(12)
+        out2 = wp.zeros((4, 2), dtype=int, device=device)
+        cases = []
+
+        wp.launch(launch_coords_2d, dim=(2, 2), inputs=[2, out2], device=device)
+        cases.append((launch_coords_2d, 256))
+        out3 = wp.zeros((8, 3), dtype=int, device=device)
+        wp.launch(launch_coords_3d, dim=(2, 2, 2), inputs=[2, 2, out3], device=device)
+        cases.append((launch_coords_3d, 256))
+        out4 = wp.zeros((16, 4), dtype=int, device=device)
+        wp.launch(launch_coords_4d, dim=(2, 2, 2, 2), inputs=[2, 2, 2, out4], device=device)
+        cases.append((launch_coords_4d, 256))
+        tiled = wp.zeros((64, 3), dtype=int, device=device)
+        wp.launch_tiled(tiled_launch_coords, dim=[2], inputs=[32, tiled], device=device, block_dim=32)
+        cases.append((tiled_launch_coords, 32))
+
+        a = wp.array(rng.standard_normal((6, 8)).astype(np.float32), device=device)
+        wp.launch(
+            strided_view_sum, dim=(6, 4), inputs=[a[:, ::2], wp.zeros(6, dtype=float, device=device)], device=device
+        )
+        cases.append((strided_view_sum, 256))
+        rows = wp.array([0, 2, 4], dtype=int, device=device)
+        indexed = wp.indexedarray2d(a, [rows, None])
+        wp.launch(
+            indexed_copy, dim=(3, 8), inputs=[indexed, wp.zeros((3, 8), dtype=float, device=device)], device=device
+        )
+        cases.append((indexed_copy, 256))
+        wp.launch(
+            world_body_dof_grid,
+            dim=(16, 30, 35),
+            inputs=[
+                wp.ones((1, 30), dtype=float, device=device),
+                wp.zeros((1, 30), dtype=int, device=device),
+                wp.zeros((16, 35), dtype=float, device=device),
+            ],
+            device=device,
+        )
+        cases.append((world_body_dof_grid, 256))
+
+        solver = _solver_cholesky(n)
+        wp.launch_tiled(
+            solver,
+            dim=[2],
+            inputs=[
+                wp.zeros((2, n), dtype=float, device=device),
+                wp.array(np.tile(np.eye(n, dtype=np.float32), (2, 1, 1)), device=device),
+                wp.zeros(2, dtype=bool, device=device),
+                wp.zeros((2, n), dtype=float, device=device),
+                wp.zeros(2, dtype=float, device=device),
+            ],
+            device=device,
+            block_dim=32,
+        )
+        cases.append((solver, 32))
+        problem = _gathered_problem(n, 2, rng)
+        self._gathered_run(_gathered, n, device, 32, problem)
+        cases.append((_gathered(n), 32))
+
+        # divisions whose divisor is not a literal; constant divisors compile to a multiply and shift
+        division = re.compile(r"= (?:udiv|urem|sdiv|srem) (?:exact )?i64 [^,]+, (%[\w.]+)")
+        with tempfile.TemporaryDirectory() as tmp:
+            for kernel, block_dim in cases:
+                source = os.path.join(tmp, "kernel.metal")
+                with open(source, "w") as f:
+                    f.write(_metal_module_source(kernel, block_dim))
+                ir = os.path.join(tmp, "kernel.ll")
+                subprocess.run(
+                    ["xcrun", "-sdk", "macosx", "metal", "-std=metal3.2", "-O2", "-fno-fast-math", "-S", "-emit-llvm",
+                     source, "-o", ir],
+                    check=True,
+                    capture_output=True,
+                )  # fmt: skip
+                with open(ir) as f:
+                    found = [line.strip() for line in f if division.search(line)]
+                self.assertEqual(found, [], f"{kernel.key}: 64-bit division by a runtime value")
+
+    def test_fused_cholesky_kernels_request_no_matrix_tile(self):
+        """MuJoCo Warp's two Cholesky kernel shapes compile without an n x n threadgroup tile on Metal."""
+        n = 35
+        solver = _solver_cholesky(n)
+        wp.launch_tiled(
+            solver,
+            dim=[1],
+            inputs=[
+                wp.zeros((1, n), dtype=float, device=self.device),
+                wp.array(np.eye(n, dtype=np.float32)[None], device=self.device),
+                wp.zeros(1, dtype=bool, device=self.device),
+                wp.zeros((1, n), dtype=float, device=self.device),
+                wp.zeros(1, dtype=float, device=self.device),
+            ],
+            device=self.device,
+            block_dim=32,
+        )
+        meta = solver.module.load(wp.get_device(self.device), 32).meta
+        solver_bytes = max(v for key, v in meta.items() if key.endswith("forward_smem_bytes"))
+        self.assertLess(solver_bytes, n * n * 4)  # the reduction's scratch remains
+
+        _, _, gathered_shared = self._gathered_run(
+            _gathered, n, self.device, 32, _gathered_problem(n, 1, np.random.default_rng(13))
+        )
+        self.assertFalse(gathered_shared)
+        meta = _gathered(n).module.load(wp.get_device(self.device), 32).meta
+        self.assertEqual(max(v for key, v in meta.items() if key.endswith("forward_smem_bytes")), 0)
 
     def test_scalar_arguments_are_not_imported(self):
         """NumPy scalars passed by value are not treated as host arrays."""
