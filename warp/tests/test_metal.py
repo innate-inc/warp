@@ -187,6 +187,115 @@ def tiled_launch_coords(block_dim: int, out: wp.array2d[int]):
     out[i * block_dim + lane, 2] = lane
 
 
+# Kernels for the Metal fused-Cholesky rewrite (Adjoint._match_metal_fused_cholesky). The rewrite matches source
+# shapes, so each case is its own function with literal fill modes rather than one parameterized kernel.
+def _fused_upper_register(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n))
+        wp.tile_cholesky_inplace(t, fill_mode="upper")
+        y = wp.tile_load(b[w], shape=(n,))
+        s = wp.tile_cholesky_solve(t, y, fill_mode="upper")
+        wp.tile_store(x[w], s)
+
+    return k
+
+
+def _fused_lower_shared(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n))
+        wp.tile_cholesky_inplace(t)
+        y = wp.tile_load(b[w], shape=(n,), storage="shared")
+        s = wp.tile_cholesky_solve(t, y)
+        wp.tile_store(x[w], s)
+
+    return k
+
+
+def _unfused_factor_reused(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n))
+        wp.tile_cholesky_inplace(t, fill_mode="upper")
+        y = wp.tile_load(b[w], shape=(n,))
+        s = wp.tile_cholesky_solve(t, y, fill_mode="upper")
+        wp.tile_store(x[w], s)
+        total = wp.tile_sum(t)
+
+    return k
+
+
+def _unfused_offset(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n), offset=(0, 0))
+        wp.tile_cholesky_inplace(t, fill_mode="upper")
+        y = wp.tile_load(b[w], shape=(n,))
+        s = wp.tile_cholesky_solve(t, y, fill_mode="upper")
+        wp.tile_store(x[w], s)
+
+    return k
+
+
+def _unfused_storage(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n), storage="shared")
+        wp.tile_cholesky_inplace(t, fill_mode="upper")
+        y = wp.tile_load(b[w], shape=(n,))
+        s = wp.tile_cholesky_solve(t, y, fill_mode="upper")
+        wp.tile_store(x[w], s)
+
+    return k
+
+
+def _unfused_fill_modes_differ(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n))
+        wp.tile_cholesky_inplace(t, fill_mode="upper")
+        y = wp.tile_load(b[w], shape=(n,))
+        s = wp.tile_cholesky_solve(t, y, fill_mode="lower")
+        wp.tile_store(x[w], s)
+
+    return k
+
+
+def _unfused_statement_between(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        t = wp.tile_load(a[w], shape=(n, n))
+        wp.tile_cholesky_inplace(t, fill_mode="upper")
+        a[w, 0, n - 1] = a[w, 0, n - 1] + 0.0  # a write between the factorization and the solve
+        y = wp.tile_load(b[w], shape=(n,))
+        s = wp.tile_cholesky_solve(t, y, fill_mode="upper")
+        wp.tile_store(x[w], s)
+
+    return k
+
+
+def _unfused_nested(n):
+    @wp.kernel(enable_backward=False, module="unique")
+    def k(a: wp.array3d[float], b: wp.array2d[float], x: wp.array2d[float]):
+        w = wp.tid()
+        if w >= 0:
+            t = wp.tile_load(a[w], shape=(n, n))
+            wp.tile_cholesky_inplace(t, fill_mode="upper")
+            y = wp.tile_load(b[w], shape=(n,))
+            s = wp.tile_cholesky_solve(t, y, fill_mode="upper")
+            wp.tile_store(x[w], s)
+
+    return k
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -278,6 +387,90 @@ class TestMetal(unittest.TestCase):
             wp.launch_tiled(
                 tiled_launch_coords, dim=[(1 << 32) // 64], inputs=[64, out], device=self.device, block_dim=64
             )
+
+    def _fused_cholesky_case(self, make, n, block_dim, upper, rng):
+        """Launch make(n) on Metal: returns (solution, reference, whether the n x n matrix is a shared tile).
+
+        The shared matrix shows in the threadgroup memory the module requests (kept with the cached module too).
+        """
+        worlds, pad = 3, 2
+        m = rng.standard_normal((worlds, n, n)).astype(np.float32)
+        a_np = np.full((worlds, n + pad, n + pad), 7.0, dtype=np.float32)  # garbage outside the block
+        a_np[:, :n, :n] = m @ m.transpose(0, 2, 1) + n * np.eye(n, dtype=np.float32)
+        b_np = rng.standard_normal((worlds, n)).astype(np.float32)
+        x_ref = np.linalg.solve(a_np[:, :n, :n].astype(np.float64), b_np.astype(np.float64)[..., None])[..., 0]
+        # only the requested triangle may be read
+        rows, cols = np.tril_indices(n, -1) if upper else np.triu_indices(n, 1)
+        a_np[:, rows, cols] = np.nan
+        kernel = make(n)
+        x = wp.zeros((worlds, n), dtype=float, device=self.device)
+        wp.launch_tiled(
+            kernel,
+            dim=[worlds],
+            inputs=[wp.array(a_np, device=self.device), wp.array(b_np, device=self.device), x],
+            device=self.device,
+            block_dim=block_dim,
+        )
+        meta = kernel.module.load(wp.get_device(self.device), block_dim).meta
+        smem = max(v for key, v in meta.items() if key.endswith("forward_smem_bytes"))
+        return x.numpy(), x_ref, smem >= n * n * 4
+
+    def test_fused_cholesky_rewrite(self):
+        """The load, factor and solve sequence runs from registers on Metal, without a shared matrix tile.
+
+        Sizes on both sides of the register path's limits (block_dim <= 32, n <= 40): the qualifying ones take
+        the fused path, the others compile as written. The triangle the fill mode excludes is poisoned with NaN.
+        """
+        rng = np.random.default_rng(6)
+        for block_dim in (16, 32):
+            for n in sorted({block_dim - 1, block_dim, block_dim + 1, 39, 40, 41, 2 * block_dim + 1}):
+                for make, upper in ((_fused_upper_register, True), (_fused_lower_shared, False)):
+                    msg = f"{make.__name__}, n={n}, block_dim={block_dim}"
+                    try:
+                        x, x_ref, shared_matrix = self._fused_cholesky_case(make, n, block_dim, upper, rng)
+                    except RuntimeError as e:
+                        if n <= 41 or "threadgroup memory" not in str(e):
+                            raise
+                        continue
+                    np.testing.assert_allclose(x, x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
+                    self.assertEqual(shared_matrix, n > 40, msg)
+
+    def test_fused_cholesky_rewrite_leaves_other_shapes_alone(self):
+        """Code that only resembles the sequence compiles as written and gives the same results as the CPU."""
+        rng = np.random.default_rng(7)
+        cases = (
+            (_unfused_factor_reused, 35, 32),
+            (_unfused_offset, 35, 32),
+            (_unfused_storage, 35, 32),
+            (_unfused_fill_modes_differ, 35, 32),
+            (_unfused_statement_between, 35, 32),
+            (_unfused_nested, 35, 32),
+            (_fused_upper_register, 35, 64),  # block_dim above 32
+        )
+        for make, n, block_dim in cases:
+            msg = f"{make.__name__}, block_dim={block_dim}"
+            x, x_ref, shared_matrix = self._fused_cholesky_case(make, n, block_dim, True, np.random.default_rng(8))
+            self.assertTrue(shared_matrix, msg)
+            if make is _unfused_fill_modes_differ:
+                continue  # mixes an upper factor with a lower solve on purpose; compared with the CPU below
+            np.testing.assert_allclose(x, x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
+
+        # the mismatched fill modes compute whatever the unfused code computes, as on the CPU
+        a_np = rng.standard_normal((1, 35, 35)).astype(np.float32)
+        a_np = a_np @ a_np.transpose(0, 2, 1) + 35 * np.eye(35, dtype=np.float32)
+        b_np = rng.standard_normal((1, 35)).astype(np.float32)
+        results = []
+        for device, block_dim in ((self.device, 32), ("cpu", 1)):
+            x = wp.zeros((1, 35), dtype=float, device=device)
+            wp.launch_tiled(
+                _unfused_fill_modes_differ(35),
+                dim=[1],
+                inputs=[wp.array(a_np, device=device), wp.array(b_np, device=device), x],
+                device=device,
+                block_dim=block_dim,
+            )
+            results.append(x.numpy())
+        np.testing.assert_allclose(results[0], results[1], rtol=1e-4, atol=1e-4)
 
     def test_scalar_arguments_are_not_imported(self):
         """NumPy scalars passed by value are not treated as host arrays."""

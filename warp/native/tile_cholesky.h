@@ -157,6 +157,122 @@ inline WP_FORCE_INLINE void metal_register_cholesky(TileA WP_THREAD& A, TileOut 
     }
     WP_TILE_SYNC();
 }
+
+// Fused factor and solve for the code generator's Metal rewrite of
+//     t = wp.tile_load(A, shape=(n, n)); wp.tile_cholesky_inplace(t); x = wp.tile_cholesky_solve(t, y)
+// (see Adjoint._match_metal_fused_cholesky in codegen.py). The factor never leaves registers, so the kernel needs
+// no shared n x n tile, which bounds how many threadgroups a GPU core runs at once. Lane l loads its columns
+// l, l+BD, ... straight from global memory, factors them as metal_register_cholesky does, then solves L z = y
+// (one SIMD reduction per row) and L^T x = z (the owner of column j computes x[j] and broadcasts it; every
+// lane then updates the residuals of its own columns). Zero pivots are skipped in both substitutions, as in
+// scalar_cholesky_forward_substitution and scalar_cholesky_back_substitution.
+template <int V> struct metal_index {
+    static WP_CONSTANT constexpr int value = V;
+};
+
+// Calls f(metal_index<I>{}) for I in [Begin, End). The index is a compile-time constant even where the compiler
+// would not unroll a loop, so register arrays indexed by it stay in registers.
+template <int Begin, int End, typename F> inline WP_FORCE_INLINE void metal_static_for(thread F& f)
+{
+    if constexpr (Begin < End) {
+        f(metal_index<Begin> {});
+        metal_static_for<Begin + 1, End>(f);
+    }
+}
+
+// Element J of a 1D tile, the same in every lane.
+template <int J, typename T, typename L> inline WP_FORCE_INLINE T metal_tile_element(thread tile_register_t<T, L>& Y)
+{
+    return metal::simd_shuffle(Y.data[J / WP_TILE_BLOCK_DIM], ushort(J % WP_TILE_BLOCK_DIM));
+}
+template <int J, typename T, typename L, bool Owner>
+inline WP_FORCE_INLINE T metal_tile_element(thread tile_shared_t<T, L, Owner>& Y)
+{
+    return Y.data(tile_coord(J));
+}
+
+// Row I of every column the lane owns, the upper triangle of A for Upper and the lower one otherwise.
+template <int I, int N, int CPL, int BD, bool Upper, typename T>
+inline WP_FORCE_INLINE void metal_load_columns(thread T (&col)[CPL][N], array_t<T> WP_THREAD& A, int lane)
+{
+    if constexpr (I < N) {
+        auto load = [&](auto C) {
+            constexpr int c = decltype(C)::value;
+            const int jc = lane + c * BD;
+            col[c][I] = (jc < N && I >= jc)
+                ? (Upper ? wp::load(wp::address(A, jc, I)) : wp::load(wp::address(A, I, jc)))
+                : T {};
+        };
+        metal_static_for<0, CPL>(load);
+        metal_load_columns<I + 1, N, CPL, BD, Upper, T>(col, A, lane);
+    }
+}
+
+template <int J, int N, int CPL, int BD, typename T, typename TileY>
+inline WP_FORCE_INLINE void
+metal_forward_subst(thread T (&col)[CPL][N], thread T (&z)[CPL], TileY WP_THREAD& Y, int lane)
+{
+    if constexpr (J < N) {
+        constexpr int owner = J % BD;
+        constexpr int cj = J / BD;
+        T s = T {};
+        auto partial = [&](auto C) {
+            constexpr int c = decltype(C)::value;
+            if (lane + c * BD < J)
+                s += col[c][J] * z[c];  // L[J, jc] z[jc]
+        };
+        metal_static_for<0, CPL>(partial);
+        s = metal::simd_sum(s);
+        const T d = metal::simd_shuffle(col[cj][J], ushort(owner));
+        T zj = metal_tile_element<J>(Y) - s;
+        if (d != T(0.0f))
+            zj /= d;
+        if (lane == owner)
+            z[cj] = zj;
+        metal_forward_subst<J + 1, N, CPL, BD, T>(col, z, Y, lane);
+    }
+}
+
+template <int J, int N, int CPL, int BD, typename T, typename TileX>
+inline WP_FORCE_INLINE void
+metal_backward_subst(thread T (&col)[CPL][N], thread T (&r)[CPL], TileX WP_THREAD& X, int lane)
+{
+    if constexpr (J >= 0) {
+        constexpr int owner = J % BD;
+        constexpr int cj = J / BD;
+        const T d = col[cj][J];
+        const T xj = metal::simd_shuffle(d != T(0.0f) ? r[cj] / d : r[cj], ushort(owner));
+        if (lane == owner)
+            X.data[cj] = xj;
+        auto update = [&](auto C) {
+            constexpr int c = decltype(C)::value;
+            if (lane + c * BD < J)
+                r[c] -= col[c][J] * xj;  // row jc of L^T x = z: L[J, jc] x[J]
+        };
+        metal_static_for<0, CPL>(update);
+        metal_backward_subst<J - 1, N, CPL, BD, T>(col, r, X, lane);
+    }
+}
+
+template <bool Upper, typename T, typename TileY, typename TileX>
+inline WP_FORCE_INLINE void
+metal_register_cholesky_factor_solve(array_t<T> WP_THREAD& A, TileY WP_THREAD& Y, TileX WP_THREAD& X)
+{
+    constexpr int n = TileX::Layout::Shape::dim(0);
+    constexpr int BD = WP_TILE_BLOCK_DIM;
+    constexpr int CPL = (n + BD - 1) / BD;
+    static_assert(BD > 1 && BD <= 32 && n <= 40, "the code generator only emits this for block_dim <= 32 and n <= 40");
+    static_assert(TileX::Layout::NumRegs == CPL, "the solution is a register tile with one slot per owned column");
+    const int lane = WP_TILE_THREAD_IDX;
+
+    T col[CPL][n];
+    metal_load_columns<0, n, CPL, BD, Upper, T>(col, A, lane);
+    metal_register_cholesky_step<0, n, CPL, BD, T>(col, lane);
+
+    T z[CPL] = {};
+    metal_forward_subst<0, n, CPL, BD, T>(col, z, Y, lane);
+    metal_backward_subst<n - 1, n, CPL, BD, T>(col, z, X, lane);
+}
 #endif  // __METAL_VERSION__
 
 template <bool Upper, typename TileA, typename TileOut>
@@ -607,6 +723,18 @@ void adj_tile_cholesky_inplace(Fwd fun_forward, TileA WP_THREAD& A, AdjFwd adj_f
     // (lower) or U (upper), adj_A holds adj_L/adj_U; on exit adj_A holds adj of the original symmetric input
 }
 
+
+#if defined(__METAL_VERSION__)
+// x with A[:n, :n] x = y, for the code generator's rewrite (see
+// partitioned_gemm::metal_register_cholesky_factor_solve).
+template <bool Upper, typename T, typename TileY, typename TileX>
+inline WP_FORCE_INLINE TileX WP_THREAD&
+tile_cholesky_factor_solve_metal(array_t<T> WP_THREAD& A, TileY WP_THREAD& Y, TileX WP_THREAD& X)
+{
+    partitioned_gemm::metal_register_cholesky_factor_solve<Upper>(A, Y, X);
+    return X;
+}
+#endif
 
 }  // namespace wp
 
