@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import ast
 import builtins
+import collections
 import contextlib
+import copy
 import ctypes
 import enum
 import functools
@@ -3514,11 +3516,19 @@ class Adjoint:
     def emit_FunctionDef(adj, node):
         adj.fun_def_lineno = node.lineno
 
-        for f in node.body:
+        i = 0
+        while i < len(node.body):
+            f = node.body[i]
             # Skip variable creation for standalone constants, including docstrings
             if isinstance(f, ast.Expr) and isinstance(f.value, ast.Constant):
+                i += 1
+                continue
+            fused = adj._match_metal_fused_cholesky(node, i) if adj.metal else None
+            if fused is not None:
+                i = adj._emit_metal_fused_cholesky(node, i, fused)
                 continue
             adj.eval(f)
+            i += 1
 
         if adj.return_var is not None and len(adj.return_var) == 1:
             if not isinstance(node.body[-1], ast.Return):
@@ -3541,6 +3551,182 @@ class Adjoint:
                 )
             var = Var(label="return_type", type=ret_type)
             adj.return_var = (var,)
+
+    # Metal rewrite of a dense Cholesky solve. On Metal a tile kernel's throughput is bounded by the threadgroup
+    # memory each threadgroup requests, and tile_cholesky_inplace forces its input into an n x n shared tile.
+    # At a function's top level,
+    #     t = wp.tile_load(A, shape=(n, n))
+    #     wp.tile_cholesky_inplace(t, fill_mode=F)
+    #     [name = wp.tile_load(...)]*       (reads only, e.g. the right-hand side)
+    #     x = wp.tile_cholesky_solve(t, y, fill_mode=F)
+    # with t used nowhere else is compiled as x = tile_cholesky_factor_solve_metal(A, y, fill_mode=F), which keeps
+    # the factor in registers. Only for block_dim <= 32 and n <= 40 (the register Cholesky), forward-only builds,
+    # and pure array expressions; anything else compiles exactly as before, so a failed match only costs speed.
+    metal_fused_cholesky_rewrites: ClassVar[collections.Counter] = collections.Counter()  # qualname -> rewrites
+
+    def _calls_warp_builtin(adj, node, name):
+        if not isinstance(node, ast.Call):
+            return False
+        func_node = node.func
+        while isinstance(func_node, ast.Attribute):
+            func_node = func_node.value
+        if not isinstance(func_node, ast.Name):
+            return False  # only plain (dotted) names: resolving them has no side effects
+        func, path = adj.resolve_static_expression(node.func, eval_types=False)
+        builtin = warp._src.context.builtin_functions.get(name)
+        if isinstance(func, warp._src.context.Function):
+            return func is builtin
+        return func is warp and len(path) > 1 and path[-1] == name and builtin is not None
+
+    def _static_int(adj, node):
+        if isinstance(node, ast.Constant):
+            value = node.value
+        elif isinstance(node, ast.Name):
+            symbol = adj.symbols.get(node.id)
+            if symbol is None:
+                value = adj.resolve_external_reference(node.id)
+            elif isinstance(symbol, Var):
+                value = symbol.constant
+            else:
+                return None
+        else:
+            return None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    @staticmethod
+    def _pure_array_expression(node):
+        """Names used by ``a`` or ``a[i, ...]`` with name or constant indices, or None for anything else."""
+        if isinstance(node, ast.Name):
+            return {node.id}
+        if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            index = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+            if all(isinstance(e, (ast.Name, ast.Constant)) for e in index):
+                return {node.value.id} | {e.id for e in index if isinstance(e, ast.Name)}
+        return None
+
+    @staticmethod
+    def _fill_mode(call, position):
+        if len(call.args) > position:
+            return None  # positional fill_mode: not matched
+        modes = [k.value for k in call.keywords if k.arg == "fill_mode"]
+        if len(call.keywords) != len(modes):
+            return None
+        if not modes:
+            return "lower"
+        if isinstance(modes[0], ast.Constant) and modes[0].value in ("lower", "upper"):
+            return modes[0].value
+        return None
+
+    def _match_metal_fused_cholesky(adj, fn_node, i):
+        options = adj.builder_options
+        block_dim = options.get("block_dim", 1)
+        if not (1 < block_dim <= 32):
+            return None
+        if (
+            options.get("enable_backward", True)
+            and adj.used_by_backward_kernel
+            and not options.get("metal_forward_only")
+        ):
+            return None
+        body = fn_node.body
+
+        load = body[i]
+        if not (
+            isinstance(load, ast.Assign)
+            and len(load.targets) == 1
+            and isinstance(load.targets[0], ast.Name)
+            and adj._calls_warp_builtin(load.value, "tile_load")
+            and len(load.value.args) == 1
+            and [k.arg for k in load.value.keywords] == ["shape"]
+        ):
+            return None
+        t = load.targets[0].id
+        array_node = load.value.args[0]
+        array_names = adj._pure_array_expression(array_node)
+        shape = load.value.keywords[0].value
+        if array_names is None or t in array_names or not isinstance(shape, ast.Tuple) or len(shape.elts) != 2:
+            return None
+        n = adj._static_int(shape.elts[0])
+        if n is None or n != adj._static_int(shape.elts[1]) or not (1 <= n <= 40):
+            return None
+
+        if i + 1 >= len(body):
+            return None
+        factor = body[i + 1]
+        if not (
+            isinstance(factor, ast.Expr)
+            and adj._calls_warp_builtin(factor.value, "tile_cholesky_inplace")
+            and len(factor.value.args) >= 1
+            and isinstance(factor.value.args[0], ast.Name)
+            and factor.value.args[0].id == t
+        ):
+            return None
+        fill_mode = adj._fill_mode(factor.value, 1)
+
+        j = i + 2
+        bound = set()  # names assigned by the loads in between
+        while j < len(body):
+            stmt = body[j]
+            if not (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+                and adj._calls_warp_builtin(stmt.value, "tile_load")
+            ):
+                break
+            if any(isinstance(n_, ast.Name) and n_.id == t for n_ in ast.walk(stmt)):
+                return None
+            bound.add(stmt.targets[0].id)
+            j += 1
+        if j >= len(body) or fill_mode is None or bound & (array_names | {t}):
+            return None
+
+        solve = body[j]
+        if not (
+            isinstance(solve, ast.Assign)
+            and len(solve.targets) == 1
+            and isinstance(solve.targets[0], ast.Name)
+            and solve.targets[0].id != t
+            and adj._calls_warp_builtin(solve.value, "tile_cholesky_solve")
+            and len(solve.value.args) == 2
+            and isinstance(solve.value.args[0], ast.Name)
+            and solve.value.args[0].id == t
+            and adj._fill_mode(solve.value, 2) == fill_mode
+        ):
+            return None
+        rhs = solve.value.args[1]
+        if any(isinstance(n_, ast.Name) and n_.id == t for n_ in ast.walk(rhs)):
+            return None
+
+        # t must not be used anywhere else in the function
+        rewritten = {id(load), id(factor), id(solve)}
+        for stmt in body:
+            if id(stmt) in rewritten:
+                continue
+            if any(isinstance(n_, ast.Name) and n_.id == t for n_ in ast.walk(stmt)):
+                return None
+        return j, array_node, rhs, solve.targets[0].id, fill_mode
+
+    def _emit_metal_fused_cholesky(adj, fn_node, i, match):
+        j, array_node, rhs, target, fill_mode = match
+        for stmt in fn_node.body[i + 2 : j]:  # the loads in between, unchanged
+            adj.eval(stmt)
+        solve = fn_node.body[j]
+        func = ast.Name(id="tile_cholesky_factor_solve_metal", ctx=ast.Load())
+        func.warp_func = warp._src.context.builtin_functions["tile_cholesky_factor_solve_metal"]
+        call = ast.Call(
+            func=func,
+            args=[copy.deepcopy(array_node), copy.deepcopy(rhs)],
+            keywords=[ast.keyword(arg="fill_mode", value=ast.Constant(fill_mode))],
+        )
+        stmt = ast.Assign(targets=[ast.Name(id=target, ctx=ast.Store())], value=call)
+        ast.copy_location(stmt, solve)
+        ast.fix_missing_locations(stmt)
+        for n_ in ast.walk(stmt):
+            ast.copy_location(n_, solve)
+        adj.eval(stmt)
+        Adjoint.metal_fused_cholesky_rewrites[getattr(adj.func, "__qualname__", adj.fun_name)] += 1
+        return j + 1
 
     def emit_If(adj, node):
         if len(node.body) == 0:

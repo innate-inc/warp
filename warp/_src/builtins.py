@@ -17122,6 +17122,48 @@ add_builtin(
 )
 
 
+def tile_cholesky_factor_solve_metal_value_func(arg_types, arg_values):
+    if arg_types is None:
+        return tile(dtype=Float, shape=tuple[int], storage="register")
+    a, y = arg_types["A"], arg_types["y"]
+    if not is_array(a) or a.ndim != 2:
+        raise TypeError("tile_cholesky_factor_solve_metal() 'A' must be a 2D array")
+    if not is_tile(y) or len(y.shape) != 1:
+        raise TypeError("tile_cholesky_factor_solve_metal() 'y' must be a 1D tile")
+    if a.dtype != y.dtype:
+        raise TypeError("tile_cholesky_factor_solve_metal() 'A' and 'y' must have the same dtype")
+    return tile(dtype=y.dtype, shape=y.shape, storage="register")
+
+
+def tile_cholesky_factor_solve_metal_lto_dispatch_func(
+    arg_types: Mapping[str, type],
+    return_type: Any,
+    return_values: List[Var],
+    arg_values: Mapping[str, Var],
+    options: Mapping[str, Any],
+    builder: warp._src.context.ModuleBuilder,
+):
+    upper = _tile_cholesky_extract_fill_mode(arg_values, func_name="tile_cholesky_factor_solve_metal")
+    return ((arg_values["A"], arg_values["y"], return_values[0]), [upper], [], 0)
+
+
+# Emitted only by the Metal code generator, never called by name: Adjoint._match_metal_fused_cholesky rewrites
+# ``t = wp.tile_load(A, shape=(n, n)); wp.tile_cholesky_inplace(t); x = wp.tile_cholesky_solve(t, y)`` into it.
+add_builtin(
+    "tile_cholesky_factor_solve_metal",
+    input_types={"A": array(dtype=Float), "y": tile(dtype=Float, shape=tuple[int]), "fill_mode": str},
+    defaults={"fill_mode": "lower"},
+    value_func=tile_cholesky_factor_solve_metal_value_func,
+    lto_dispatch_func=tile_cholesky_factor_solve_metal_lto_dispatch_func,
+    variadic=True,
+    doc="Solve ``A[:n, :n] x = y`` by Cholesky factorization without materializing the factor (Metal only).",
+    group="Tile Primitives",
+    export=False,
+    hidden=True,
+    is_differentiable=False,
+)
+
+
 add_builtin(
     "tile_cholesky_solve_inplace",
     input_types={
