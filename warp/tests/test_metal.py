@@ -152,6 +152,11 @@ def _make_tile_matmul_kernel(n: int):
     return tile_products
 
 
+@wp.kernel(enable_backward=False)
+def raise_kernel(code: int):
+    wp.metal_raise(code)
+
+
 @unittest.skipUnless(metal_available(), "Requires an Apple GPU")
 class TestMetal(unittest.TestCase):
     device = "metal:0"
@@ -204,6 +209,49 @@ class TestMetal(unittest.TestCase):
         self.assertFalse(wp.get_device(self.device).is_capturing)
         wp.sparse.bsr_set_from_triplets(m, rows, cols, vals)  # fine outside a capture
         self.assertEqual(m.nnz_sync(), 2)
+
+    def test_device_error_raises_at_synchronize(self):
+        """A kernel's wp.metal_raise(code) is raised by the next synchronize, once, and the first error wins."""
+        device = wp.get_device(self.device)
+        wp.synchronize_device(device)
+
+        wp.launch(raise_kernel, dim=64, inputs=[7], device=device)
+        with self.assertRaisesRegex(RuntimeError, "Metal kernel reported error code 7"):
+            wp.synchronize_device(device)
+        wp.synchronize_device(device)  # cleared
+
+        wp.launch(raise_kernel, dim=1, inputs=[5], device=device)
+        wp.launch(raise_kernel, dim=1, inputs=[9], device=device)
+        with self.assertRaisesRegex(RuntimeError, "error code 5"):
+            wp.synchronize_device(device)
+        wp.synchronize_device(device)
+
+        wp.launch(raise_kernel, dim=1, inputs=[1], device=device)
+        with self.assertRaisesRegex(RuntimeError, "fused Cholesky: the factor store overlaps"):
+            wp.synchronize_device(device)
+
+        # reading an array synchronizes too, so it raises as well
+        a = wp.zeros(4, dtype=float, device=device)
+        wp.launch(raise_kernel, dim=1, inputs=[11], device=device)
+        with self.assertRaisesRegex(RuntimeError, "error code 11"):
+            a.numpy()
+        np.testing.assert_array_equal(a.numpy(), 0.0)
+
+        # kernels that do not report leave the channel clear
+        wp.launch(increment_kernel, dim=4, inputs=[a], device=device)
+        wp.synchronize_device(device)
+
+    def test_device_error_raises_after_graph_replay(self):
+        """Errors reported by a kernel in a captured graph are raised after the replay, and cleared."""
+        device = wp.get_device(self.device)
+        with wp.ScopedCapture(device=device) as capture:
+            wp.launch(raise_kernel, dim=8, inputs=[3], device=device)
+        wp.synchronize_device(device)  # capturing records, it does not run
+        for _ in range(2):
+            wp.capture_launch(capture.graph)
+            with self.assertRaisesRegex(RuntimeError, "error code 3"):
+                wp.synchronize_device(device)
+        wp.synchronize_device(device)
 
     def test_scalar_arguments_are_not_imported(self):
         """NumPy scalars passed by value are not treated as host arrays."""
