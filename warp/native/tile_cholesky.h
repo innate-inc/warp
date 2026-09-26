@@ -199,8 +199,11 @@ inline WP_FORCE_INLINE void metal_load_columns(thread T (&col)[CPL][N], array_t<
         auto load = [&](auto C) {
             constexpr int c = decltype(C)::value;
             const int jc = lane + c * BD;
-            col[c][I] = (jc < N && I >= jc)
-                ? (Upper ? wp::load(wp::address(A, jc, I)) : wp::load(wp::address(A, I, jc)))
+            // tile_load zero-fills beyond the array, so an array smaller than the tile reads the same way
+            const int row = Upper ? jc : I;
+            const int column = Upper ? I : jc;
+            col[c][I] = (jc < N && I >= jc && row < A.shape[0] && column < A.shape[1])
+                ? wp::load(wp::address(A, row, column))
                 : T {};
         };
         metal_static_for<0, CPL>(load);

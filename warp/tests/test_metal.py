@@ -455,6 +455,25 @@ class TestMetal(unittest.TestCase):
                 continue  # mixes an upper factor with a lower solve on purpose; compared with the CPU below
             np.testing.assert_allclose(x, x_ref, rtol=1e-3, atol=1e-4, err_msg=msg)
 
+        # an array smaller than the tile: tile_load zero-fills the rest, and so do the fused loads (no read beyond
+        # the array); the matrix is then singular, so compare with the unfused CPU code value by value, NaN included
+        small = rng.standard_normal((1, 30, 30)).astype(np.float32)
+        small = small @ small.transpose(0, 2, 1) + 30 * np.eye(30, dtype=np.float32)
+        b_small = rng.standard_normal((1, 35)).astype(np.float32)
+        results = []
+        for device, block_dim in ((self.device, 32), ("cpu", 1)):
+            x = wp.zeros((1, 35), dtype=float, device=device)
+            wp.launch_tiled(
+                _fused_upper_register(35),
+                dim=[1],
+                inputs=[wp.array(small, device=device), wp.array(b_small, device=device), x],
+                device=device,
+                block_dim=block_dim,
+            )
+            results.append(x.numpy())
+        np.testing.assert_array_equal(np.isnan(results[0]), np.isnan(results[1]))
+        np.testing.assert_allclose(results[0], results[1], rtol=1e-4, atol=1e-4, equal_nan=True)
+
         # the mismatched fill modes compute whatever the unfused code computes, as on the CPU
         a_np = rng.standard_normal((1, 35, 35)).astype(np.float32)
         a_np = a_np @ a_np.transpose(0, 2, 1) + 35 * np.eye(35, dtype=np.float32)
