@@ -115,6 +115,7 @@ struct Device {
     // arrays of structs, raw addresses passed as integers): `table_slot` holds the GPU address of the current
     // sorted range table and is baked into every kernel pipeline as a function constant; a rebuild writes a
     // new table and swaps the slot, so in-flight kernels keep a consistent table.
+    // Its second 8 bytes are the device error word (see wp_metal_raise in metal_crt.h and check_device_error).
     id<MTLBuffer> table_slot;
     id<MTLBuffer> table;
     bool table_dirty = true;
@@ -412,11 +413,37 @@ bool flush(Device& dev)
 }
 
 // Commits and waits for all work, then recycles the args ring and deferred frees. Returns false on GPU errors.
+// Errors kernels report with wp_metal_raise(code); the message is raised by the next wp_metal_synchronize.
+const char* device_error_message(uint32_t code)
+{
+    switch (code) {
+    case 1:
+        return "fused Cholesky: the factor store overlaps an array loaded between the factorization and the solve";
+    default:
+        return nullptr;
+    }
+}
+
+// Reads and clears the device error word once the GPU is idle. The first error wins, on the device (the kernel
+// side swaps 0 for the code) and here (an error already waiting to be raised is kept).
+void check_device_error(Device& dev)
+{
+    uint32_t* word = reinterpret_cast<uint32_t*>(static_cast<char*>(dev.table_slot.contents) + 8);
+    const uint32_t code = __atomic_exchange_n(word, 0u, __ATOMIC_SEQ_CST);
+    if (code == 0 || !dev.deferred_error.empty())
+        return;
+    if (const char* message = device_error_message(code))
+        dev.deferred_error = message;
+    else
+        dev.deferred_error = "Metal kernel reported error code " + std::to_string(code);
+}
+
 bool synchronize(Device& dev)
 {
     bool ok = flush(dev);
     for (id<MTLCommandBuffer> command_buffer : dev.in_flight)
         [command_buffer waitUntilCompleted];
+    check_device_error(dev);
     ok = retire_completed(dev) && ok;
     dev.args_ring_offset = 0;
     release_buffers(dev, dev.deferred_frees);
@@ -1021,7 +1048,9 @@ void* wp_metal_get_kernel(void* library, const char* name)
         Device* dev = get_device(lib->ordinal);
         MTLFunctionConstantValues* constants = [MTLFunctionConstantValues new];
         uint64_t slot_address = dev ? dev->table_slot.gpuAddress : 0;
+        uint64_t error_address = dev ? dev->table_slot.gpuAddress + 8 : 0;
         [constants setConstantValue:&slot_address type:MTLDataTypeULong atIndex:0];
+        [constants setConstantValue:&error_address type:MTLDataTypeULong atIndex:1];
         id<MTLFunction> function = [lib->library newFunctionWithName:@(name) constantValues:constants error:&error];
         if (!function) {
             wp::set_error_string(
