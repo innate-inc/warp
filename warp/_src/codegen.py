@@ -1163,6 +1163,9 @@ class Var:
 
         Metal requires an explicit address space on every pointer; the macros expand to nothing elsewhere.
         """
+        # fixedarray elements live in thread stack storage; overrides any array-origin heuristic.
+        if getattr(self, "thread_memory", False):
+            return "WP_THREAD"
         if getattr(self, "array_slot", None) is not None or getattr(self, "device_memory", False):
             return "WP_DEVICE"
         origin = self.ref_origin
@@ -4570,7 +4573,11 @@ class Adjoint:
             raise WarpCodegenError("Starred expression results in empty sequence.")
         if builtin_name == "address":
             for e in elements:
-                e.device_memory = True  # element pointers into array storage
+                # fixedarray element pointers are thread-space, not device-space
+                if isinstance(target_type, fixedarray):
+                    e.thread_memory = True
+                else:
+                    e.device_memory = True  # element pointers into array storage
 
         return elements
 
@@ -4950,7 +4957,12 @@ class Adjoint:
                     )
                 # handles array loads (where each dimension has an index specified)
                 out = adj.add_builtin_call("address", [target, *indices])
-                out.device_memory = True
+                # fixedarray storage lives on the thread stack, so its element pointers
+                # are thread-space, not device-space (Metal address-space rule).
+                if isinstance(target_type, fixedarray):
+                    out.thread_memory = True
+                else:
+                    out.device_memory = True
                 if origin := adj.reference_origin_for_var(target):
                     out.ref_origin = origin.extend_array(indices)
 
@@ -6474,7 +6486,10 @@ class Adjoint:
                     current = adj.add_builtin_call("extract", [target, *indices])
                 elif is_array(target_type):
                     current = adj.add_builtin_call("address", [target, *indices])
-                    current.device_memory = True
+                    if isinstance(target_type, fixedarray):
+                        current.thread_memory = True
+                    else:
+                        current.device_memory = True
                 elif is_tile(target_type):
                     current = adj.add_builtin_call("tile_extract", [target, *indices])
                 else:

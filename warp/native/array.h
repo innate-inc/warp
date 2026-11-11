@@ -310,7 +310,7 @@ template <typename T> inline CUDA_CALLABLE array_t<T> add(const array_t<T> WP_TH
 }
 
 
-#if !defined(__METAL_VERSION__)  // TODO(metal): fixedarray_t derives from array_t; Metal has no inheritance
+#if !defined(__METAL_VERSION__)
 // Stack‑allocated counterpart to `array_t<T>`.
 // Useful for small buffers that have their shape known at compile-time,
 // and that gain from having array semantics instead of vectors.
@@ -376,6 +376,547 @@ template <int Size, typename T> struct fixedarray_t : array_t<T> {
     T storage[Size];
 };
 
+
+// Required when compiling adjoints.
+template <int Size, typename T>
+inline CUDA_CALLABLE fixedarray_t<Size, T>
+add(const fixedarray_t<Size, T> WP_THREAD& a, const fixedarray_t<Size, T> WP_THREAD& b)
+{
+    return fixedarray_t<Size, T>();
+}
+#else  // __METAL_VERSION__
+// Metal implementation of fixedarray_t.
+//
+// MSL has no struct inheritance, so this cannot derive from array_t<T>; it instead
+// replicates the array_t field layout with `thread`-space data/grad pointers, because
+// the backing storage lives on the thread's stack (array_t::data is a `device T*`, and
+// a device pointer may not address thread storage). Generic array_t helpers are not
+// reused: dedicated fixedarray_t overloads of index/address/array_store below return
+// thread-space references. Codegen must emit thread-space element pointers for a
+// fixedarray target (see Var.address_space / emit_indexing in codegen.py).
+//
+// Only value semantics are supported (construct, assign, index, store, load, .shape,
+// .data, component access). Aliasing a fixedarray's storage into a device array_t via
+// raw-pointer arithmetic (array_t(ptr=fa.ptr + off, ...)) is NOT supported on Metal:
+// such a device pointer cannot legally address thread storage.
+template <int Size, typename T> struct fixedarray_t {
+    static_assert(Size > 0, "Expected Size > 0");
+
+    T storage[Size];
+    T WP_THREAD* data;
+    T WP_THREAD* grad;
+    shape_t shape;
+    int strides[ARRAY_MAX_DIMS];
+    uint16_t ndim;
+    uint16_t flags;
+
+    // (Re)point data/grad at this object's own storage; must run after any copy since
+    // the default memberwise copy would carry over the source's storage pointers.
+    CUDA_CALLABLE inline void repoint()
+    {
+        this->data = this->storage;
+    }
+
+    CUDA_CALLABLE inline fixedarray_t()
+        : storage()
+        , data(storage)
+        , grad(nullptr)
+        , shape()
+        , strides()
+        , ndim(1)
+        , flags(0)
+    {
+        shape.dims[0] = Size;
+        shape.dims[1] = 0;
+        shape.dims[2] = 0;
+        shape.dims[3] = 0;
+        strides[0] = sizeof(T);
+        strides[1] = 0;
+        strides[2] = 0;
+        strides[3] = 0;
+    }
+
+    CUDA_CALLABLE fixedarray_t(int dim0, T WP_THREAD* grad = nullptr)
+        : storage()
+        , data(storage)
+        , grad(grad)
+        , shape()
+        , strides()
+        , ndim(1)
+        , flags(0)
+    {
+        assert(Size == dim0);
+        shape.dims[0] = dim0;
+        strides[0] = sizeof(T);
+    }
+
+    CUDA_CALLABLE fixedarray_t(int dim0, int dim1, T WP_THREAD* grad = nullptr)
+        : storage()
+        , data(storage)
+        , grad(grad)
+        , shape()
+        , strides()
+        , ndim(2)
+        , flags(0)
+    {
+        assert(Size == dim0 * dim1);
+        shape.dims[0] = dim0;
+        shape.dims[1] = dim1;
+        strides[0] = dim1 * sizeof(T);
+        strides[1] = sizeof(T);
+    }
+
+    CUDA_CALLABLE fixedarray_t(int dim0, int dim1, int dim2, T WP_THREAD* grad = nullptr)
+        : storage()
+        , data(storage)
+        , grad(grad)
+        , shape()
+        , strides()
+        , ndim(3)
+        , flags(0)
+    {
+        assert(Size == dim0 * dim1 * dim2);
+        shape.dims[0] = dim0;
+        shape.dims[1] = dim1;
+        shape.dims[2] = dim2;
+        strides[0] = dim1 * dim2 * sizeof(T);
+        strides[1] = dim2 * sizeof(T);
+        strides[2] = sizeof(T);
+    }
+
+    CUDA_CALLABLE fixedarray_t(int dim0, int dim1, int dim2, int dim3, T WP_THREAD* grad = nullptr)
+        : storage()
+        , data(storage)
+        , grad(grad)
+        , shape()
+        , strides()
+        , ndim(4)
+        , flags(0)
+    {
+        assert(Size == dim0 * dim1 * dim2 * dim3);
+        shape.dims[0] = dim0;
+        shape.dims[1] = dim1;
+        shape.dims[2] = dim2;
+        shape.dims[3] = dim3;
+        strides[0] = dim1 * dim2 * dim3 * sizeof(T);
+        strides[1] = dim2 * dim3 * sizeof(T);
+        strides[2] = dim3 * sizeof(T);
+        strides[3] = sizeof(T);
+    }
+
+    CUDA_CALLABLE inline fixedarray_t(const fixedarray_t<Size, T> WP_THREAD& other)
+        : storage()
+        , data(storage)
+        , grad(nullptr)
+        , shape(other.shape)
+        , strides()
+        , ndim(other.ndim)
+        , flags(other.flags)
+    {
+        for (unsigned int i = 0; i < Size; ++i)
+            storage[i] = other.storage[i];
+        for (unsigned int i = 0; i < ARRAY_MAX_DIMS; ++i)
+            strides[i] = other.strides[i];
+    }
+
+    CUDA_CALLABLE fixedarray_t<Size, T> WP_THREAD& operator=(const fixedarray_t<Size, T> WP_THREAD& other)
+    {
+        for (unsigned int i = 0; i < Size; ++i)
+            storage[i] = other.storage[i];
+        data = storage;
+        grad = nullptr;
+        shape = other.shape;
+        for (unsigned int i = 0; i < ARRAY_MAX_DIMS; ++i)
+            strides[i] = other.strides[i];
+        ndim = other.ndim;
+        flags = other.flags;
+        return *this;
+    }
+
+    CUDA_CALLABLE inline bool empty() const { return !data; }
+};
+
+// ---- fixedarray_t element access (thread address space) ----
+// These mirror the array_t<T> index/address/array_store helpers but bind a
+// fixedarray_t<Size,T> directly (its two template params do not match the
+// `template <typename> class A` form used by the generic array helpers) and
+// yield thread-space references/pointers into the stack storage.
+
+template <int Size, typename T>
+CUDA_CALLABLE inline size_t fa_byte_offset(const fixedarray_t<Size, T> WP_THREAD& arr, int i)
+{
+    if (i < 0)
+        i += arr.shape[0];
+    return (size_t)i * sizeof(T);
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline size_t fa_byte_offset(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j)
+{
+    if (i < 0)
+        i += arr.shape[0];
+    if (j < 0)
+        j += arr.shape[1];
+    return (size_t)i * arr.strides[0] + (size_t)j * arr.strides[1];
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline size_t fa_byte_offset(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k)
+{
+    if (i < 0)
+        i += arr.shape[0];
+    if (j < 0)
+        j += arr.shape[1];
+    if (k < 0)
+        k += arr.shape[2];
+    return (size_t)i * arr.strides[0] + (size_t)j * arr.strides[1] + (size_t)k * arr.strides[2];
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline size_t fa_byte_offset(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k, int l)
+{
+    if (i < 0)
+        i += arr.shape[0];
+    if (j < 0)
+        j += arr.shape[1];
+    if (k < 0)
+        k += arr.shape[2];
+    if (l < 0)
+        l += arr.shape[3];
+    return (size_t)i * arr.strides[0] + (size_t)j * arr.strides[1] + (size_t)k * arr.strides[2]
+         + (size_t)l * arr.strides[3];
+}
+
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index(const fixedarray_t<Size, T> WP_THREAD& arr, int i)
+{
+    assert(arr.ndim == 1);
+    return *(reinterpret_cast<T WP_THREAD*>(reinterpret_cast<thread char*>(arr.data) + fa_byte_offset(arr, i)));
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j)
+{
+    assert(arr.ndim == 2);
+    return *(reinterpret_cast<T WP_THREAD*>(reinterpret_cast<thread char*>(arr.data) + fa_byte_offset(arr, i, j)));
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k)
+{
+    assert(arr.ndim == 3);
+    return *(reinterpret_cast<T WP_THREAD*>(reinterpret_cast<thread char*>(arr.data) + fa_byte_offset(arr, i, j, k)));
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k, int l)
+{
+    assert(arr.ndim == 4);
+    return *(
+        reinterpret_cast<T WP_THREAD*>(reinterpret_cast<thread char*>(arr.data) + fa_byte_offset(arr, i, j, k, l)));
+}
+
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD* address(const fixedarray_t<Size, T> WP_THREAD& arr, int i)
+{
+    return &index(arr, i);
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD* address(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j)
+{
+    return &index(arr, i, j);
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD* address(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k)
+{
+    return &index(arr, i, j, k);
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD* address(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k, int l)
+{
+    return &index(arr, i, j, k, l);
+}
+
+template <int Size, typename T>
+CUDA_CALLABLE inline void array_store(const fixedarray_t<Size, T> WP_THREAD& arr, int i, T value)
+{
+    index(arr, i) = value;
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline void array_store(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, T value)
+{
+    index(arr, i, j) = value;
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline void array_store(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k, T value)
+{
+    index(arr, i, j, k) = value;
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline void array_store(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k, int l, T value)
+{
+    index(arr, i, j, k, l) = value;
+}
+
+// ---- fixedarray_t atomics (thread-local: plain read-modify-write) ----
+// Codegen emits wp::atomic_add for augmented-assignment into array elements
+// (`buf[i] += v`). fixedarray storage is thread stack memory, so a plain += is
+// correct and no hardware atomic is required (or possible).
+
+template <int Size, typename T>
+CUDA_CALLABLE inline T atomic_add(const fixedarray_t<Size, T> WP_THREAD& buf, int i, T value)
+{
+    T WP_THREAD& slot = index(buf, i);
+    T old = slot;
+    slot = old + value;
+    return old;
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T atomic_add(const fixedarray_t<Size, T> WP_THREAD& buf, int i, int j, T value)
+{
+    T WP_THREAD& slot = index(buf, i, j);
+    T old = slot;
+    slot = old + value;
+    return old;
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T atomic_add(const fixedarray_t<Size, T> WP_THREAD& buf, int i, int j, int k, T value)
+{
+    T WP_THREAD& slot = index(buf, i, j, k);
+    T old = slot;
+    slot = old + value;
+    return old;
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T atomic_add(const fixedarray_t<Size, T> WP_THREAD& buf, int i, int j, int k, int l, T value)
+{
+    T WP_THREAD& slot = index(buf, i, j, k, l);
+    T old = slot;
+    slot = old + value;
+    return old;
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T atomic_sub(const fixedarray_t<Size, T> WP_THREAD& buf, int i, T value)
+{
+    return atomic_add(buf, i, -value);
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T atomic_sub(const fixedarray_t<Size, T> WP_THREAD& buf, int i, int j, T value)
+{
+    return atomic_add(buf, i, j, -value);
+}
+
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_atomic_add(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    T value,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    T WP_THREAD& adj_value,
+    const T WP_THREAD& adj_ret)
+{
+    if (adj_buf.data)
+        adj_value += T(index(adj_buf, i));
+    else if (buf.grad)
+        adj_value += T(index_grad(buf, i));
+}
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_atomic_add(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    int j,
+    T value,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    int adj_j,
+    T WP_THREAD& adj_value,
+    const T WP_THREAD& adj_ret)
+{
+    if (adj_buf.data)
+        adj_value += T(index(adj_buf, i, j));
+    else if (buf.grad)
+        adj_value += T(index_grad(buf, i, j));
+}
+
+// ---- fixedarray_t adjoints (thread address space) ----
+// fixedarray storage is thread-local, so gradient accumulation is a plain += (no atomics).
+// index_grad addresses buf.grad (a thread-space T*) with the same shape/strides as buf.
+
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index_grad(const fixedarray_t<Size, T> WP_THREAD& arr, int i)
+{
+    return *(reinterpret_cast<T WP_THREAD*>(reinterpret_cast<thread char*>(arr.grad) + fa_byte_offset(arr, i)));
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index_grad(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j)
+{
+    return *(reinterpret_cast<T WP_THREAD*>(reinterpret_cast<thread char*>(arr.grad) + fa_byte_offset(arr, i, j)));
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index_grad(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k)
+{
+    return *(
+        reinterpret_cast<T WP_THREAD*>(reinterpret_cast<thread char*>(arr.grad) + fa_byte_offset(arr, i, j, k)));
+}
+template <int Size, typename T>
+CUDA_CALLABLE inline T WP_THREAD& index_grad(const fixedarray_t<Size, T> WP_THREAD& arr, int i, int j, int k, int l)
+{
+    return *(reinterpret_cast<T WP_THREAD*>(
+        reinterpret_cast<thread char*>(arr.grad) + fa_byte_offset(arr, i, j, k, l)));
+}
+
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_address(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    const T WP_THREAD& adj_output)
+{
+    if (adj_buf.data)
+        index(adj_buf, i) += adj_output;
+    else if (buf.grad)
+        index_grad(buf, i) += adj_output;
+}
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_address(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    int j,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    int adj_j,
+    const T WP_THREAD& adj_output)
+{
+    if (adj_buf.data)
+        index(adj_buf, i, j) += adj_output;
+    else if (buf.grad)
+        index_grad(buf, i, j) += adj_output;
+}
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_address(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    int j,
+    int k,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    int adj_j,
+    int adj_k,
+    const T WP_THREAD& adj_output)
+{
+    if (adj_buf.data)
+        index(adj_buf, i, j, k) += adj_output;
+    else if (buf.grad)
+        index_grad(buf, i, j, k) += adj_output;
+}
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_address(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    int j,
+    int k,
+    int l,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    int adj_j,
+    int adj_k,
+    int adj_l,
+    const T WP_THREAD& adj_output)
+{
+    if (adj_buf.data)
+        index(adj_buf, i, j, k, l) += adj_output;
+    else if (buf.grad)
+        index_grad(buf, i, j, k, l) += adj_output;
+}
+
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_array_store(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    T value,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    T WP_THREAD& adj_value)
+{
+    if (adj_buf.data) {
+        T WP_THREAD& g = index(adj_buf, i);
+        adj_value += T(g);
+        if (buf.grad && adj_buf.data == buf.grad)
+            g = T {};
+    } else if (buf.grad) {
+        T WP_THREAD& g = index_grad(buf, i);
+        adj_value += T(g);
+        g = T {};
+    }
+}
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_array_store(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    int j,
+    T value,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    int adj_j,
+    T WP_THREAD& adj_value)
+{
+    if (adj_buf.data) {
+        T WP_THREAD& g = index(adj_buf, i, j);
+        adj_value += T(g);
+        if (buf.grad && adj_buf.data == buf.grad)
+            g = T {};
+    } else if (buf.grad) {
+        T WP_THREAD& g = index_grad(buf, i, j);
+        adj_value += T(g);
+        g = T {};
+    }
+}
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_array_store(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    int j,
+    int k,
+    T value,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    int adj_j,
+    int adj_k,
+    T WP_THREAD& adj_value)
+{
+    if (adj_buf.data) {
+        T WP_THREAD& g = index(adj_buf, i, j, k);
+        adj_value += T(g);
+        if (buf.grad && adj_buf.data == buf.grad)
+            g = T {};
+    } else if (buf.grad) {
+        T WP_THREAD& g = index_grad(buf, i, j, k);
+        adj_value += T(g);
+        g = T {};
+    }
+}
+template <int Size, typename T>
+inline CUDA_CALLABLE void adj_array_store(
+    const fixedarray_t<Size, T> WP_THREAD& buf,
+    int i,
+    int j,
+    int k,
+    int l,
+    T value,
+    const fixedarray_t<Size, T> WP_THREAD& adj_buf,
+    int adj_i,
+    int adj_j,
+    int adj_k,
+    int adj_l,
+    T WP_THREAD& adj_value)
+{
+    if (adj_buf.data) {
+        T WP_THREAD& g = index(adj_buf, i, j, k, l);
+        adj_value += T(g);
+        if (buf.grad && adj_buf.data == buf.grad)
+            g = T {};
+    } else if (buf.grad) {
+        T WP_THREAD& g = index_grad(buf, i, j, k, l);
+        adj_value += T(g);
+        g = T {};
+    }
+}
 
 // Required when compiling adjoints.
 template <int Size, typename T>
